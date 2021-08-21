@@ -1,0 +1,3691 @@
+---
+title: "QAR A320完整分析"
+author: "hukun 2015010812"
+date: "2019年3月14日"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#数据预处理
+```{r}
+#加入空地电门
+add1=list.files("D:/THU PC/学习/科研/国航QAR/320_phase_height4/A320",full.names=TRUE)
+GND=list()
+for(i in 1:5128){
+  GND[[i]]=read.csv(add1[i],stringsAsFactors=FALSE,header=FALSE)[-1:-2,c(4,7:8)]
+  colnames(GND[[i]])=GND[[i]][1,]
+  GND[[i]]=GND[[i]][-1,]
+  GND[[i]][,1]=as.numeric(GND[[i]][,1])
+  GND[[i]][,2]=as.factor(GND[[i]][,2])
+  GND[[i]][,3]=as.factor(GND[[i]][,3])
+}
+
+library(dplyr)
+for(i in 1:5128){
+  a320[[i]]=left_join(a320[[i]],GND[[i]],by=c("line_index"="line_index"))
+}
+
+#读取重着陆异常样本
+load("D:/THU PC/学习/科研/国航QAR/final/final vic/heavy320.RData")
+
+#write.csv(a320[[2631]],file="D:/THU PC/学习/科研/国航QAR/final/final vic/320系列重着陆导出数据/B-6846_20180309071151合并.csv",row.names=FALSE)
+```
+
+#提取hlast和vylast,去掉异常样本
+```{r}
+#提取idlnd
+idlnd=numeric()
+for(i in 1:5128){
+  id=min(which(a320[[i]]$`AIRCRAFT ON GROUND (CFM)_592`=="YES"))
+  if(id!=Inf){
+    idlnd[i]=id
+  }else if(min(which(a320[[i]]$`AIRCRAFT ON GROUND (CFM)_599`=="YES"))!=Inf){
+    idlnd[i]=min(which(a320[[i]]$`AIRCRAFT ON GROUND (CFM)_599`=="YES"))
+  }
+}
+#把没有空地电门的从valid里去掉
+valid=c(1:5128)[which(is.na(idlnd)==FALSE)]
+
+#老师重新定义的idlndnew
+idlndnew=idlnd
+for(i in 1:5128){
+  X=a320[[i]]
+  t0 <- min(which(X$Radio.Height.1_1<=4)) # time of touchdown
+  tgnd <- which(X$`AIRCRAFT ON GROUND (CFM)_599` == "YES")
+  if (length(tgnd) > 0){
+    t0 <- max(min(tgnd), t0)
+  }
+  idlndnew[i]=t0
+}
+
+
+
+
+
+
+##提取hlast,vylast,alnd
+hlast=data.frame(rep(NA,19))
+for(k in 1:3299){
+  i=valid[k]
+  hlast[,k]=-(a320[[i]]$height[(idlnd[i]-18):idlnd[i]])
+  #着陆高度统一成0
+}
+min(hlast[1,])
+colnames(hlast)[1]="V1"
+hlast=as.matrix(hlast)
+#去掉高度一直在0附近徘徊的
+idout=which(hlast[1,]>(-1))
+
+vylast=data.frame(rep(NA,19))
+for(k in 1:3299){
+  i=valid[k]
+  vylast[,k]=as.numeric(-a320[[i]]$Inertial.Vertical.spd.CA[(idlnd[i]-18):idlnd[i]])
+}
+colnames(vylast)[1]="V1"
+vylast=as.matrix(vylast)
+
+alnd=numeric()
+for(i in 1:3299){
+  k=valid[i]
+  alnd[i]=a320[[k]]$maxacc[idlnd[k]]
+}
+macc=numeric() #50-0ft整个拉平过程中出现过的最大垂直过载
+for(i in 1:3034){
+  k=valid[c(1:3299)[-idabnorm][i]]
+  macc[i]=max(a320[[k]]$maxacc[(idlnd[k]-18+id50[k]-1):idlnd[k]])
+}
+
+#提取id50,id80,id60,id40,id20
+id50=numeric()
+id80=numeric()
+id60=numeric()
+id40=numeric()
+id20=numeric()
+for(k in 1:3299){
+  i=valid[k]
+  id50[i]=max(which(hlast[,k]<(-50)))  #id50取大于50ft的最后一个点,id80,60,40取小于的第一个点
+  id80[i]=min(which(hlast[,k]>(-80)))
+  id60[i]=min(which(hlast[,k]>(-60)))
+  id40[i]=min(which(hlast[,k]>(-40)))
+  id20[k]=min(which(hlast[,k]>(-20)))-1  #id20取达到20前的那个点
+}
+#summary(id20[-idout])
+#summary(id80[valid][-idout])
+
+```
+
+#整体降速tau的分析,h-v拟合tau,计算理想降落时间和实际tau
+```{r}
+##整体降速规律分析
+#去掉速度/高度有异常的样本不作拟合下面的条件和idout取并集)
+#速度：倒数第5,6,7点速度存在小于着陆速度的
+#高度：相隔3秒高度降低<1ft的,包括高度上升的 且 倒数第2s高度是负的
+idabnorm=numeric()#
+for(i in 1:3299){
+  if((length(hlast[diff(hlast[,i],3)<1,i])!=0 && hlast[18,i]<0|| min(vylast[13:14,i])<vylast[19,i])){
+    idabnorm=c(idabnorm,i)
+  }
+}
+idabnorm=union(idabnorm,idout)
+#用原始不作差的高度找异常样本,暂时不用
+idabnorm1=numeric()#
+for(i in 1:3299){
+  if((length(hlast[diff(hlast[,i],3)<1,i])!=0 && hlast[18,i]<0|| min(vylast[13:14,i])<vylast[19,i])){
+    idabnorm1=c(idabnorm1,i)
+  }
+}
+idabnorm1=union(idabnorm1,idout)
+
+
+#拟合tau,v0,计算理想着陆时长ti,实际着陆时长tt,v-h拟合v的boxcox变换lambda,>1就是上凸
+library(MASS)
+tau=numeric()
+v0=numeric()
+ti=numeric()
+tt=numeric()
+lambda=numeric()
+r2=numeric()
+library(car)
+for(i in 1:3034){ #439,1361,1750,2640,2795倒数第一秒速度为负
+  k=c(1:3299)[-idabnorm][i]
+  #fit1=lm(v~h,data=data.frame(h=-hlast[id50[valid][k]:18,k],v=vylast[id50[valid][k]:18,k]/60))
+  #r2[i]=summary(fit1)$r.square
+  if(length(which(vylast[id50[valid][k]:18,k]<50))==0){
+    fit=lm((v-50/60)~h-1,data=data.frame(h=-hlast[id50[valid][k]:18,k],v=vylast[id50[valid][k]:18,k]/60))
+    lambda[i]=powerTransform(fit)$lambda
+  }else{
+    vy=vylast[id50[valid][k]:18,k]
+    vy[which(vylast[id50[valid][k]:18,k]<50)]=51
+    fit=lm((v-50/60)~h-1,data=data.frame(h=-hlast[id50[valid][k]:18,k],v=vy/60))
+    lambda[i]=powerTransform(fit)$lambda
+  }
+    #tau[i]=1/fit1$coefficients[2]
+    #v0[i]=fit1$coefficients[1]*60  #转换为ft/min
+    #ti[i]=tau[i]*log(1-(hlast[id50[valid][k],k]-hlast[19,k])/v0[i]/tau[i]*60) #1-是因为hlast是负的
+    #tt[i]=19-id50[valid][k]
+}
+
+#真实拉平点位置判断,找真实拉平过程最大acc,真实拉平高度hlap
+idlap1=numeric()
+hlap1=numeric()
+id150=numeric()
+id120=numeric()
+#macc=numeric()
+maxacc=attrnew$maxacc2
+maxpitch=attrnew$maxpitch2
+maxroll=attrnew$maxroll2
+for(i in 1:3034){
+  k=valid[c(1:3299)[-idabnorm][i]]
+  #dat=a320[[k]][1:idlnd[k],]
+  #id120[k]=max(which(dat$height>120))+1
+  #dat=a320[[k]][id120[k]:idlnd[k],]
+  dat=a320[[k]][(idlnd[k]-18):idlnd[k],]
+  #idp=intersect(which(diff(dat$pitch.agl)>0),which(diff(dat$pitch.agl,2)>0))
+  #idv=intersect(which(diff(dat$Inertial.Vertical.spd.CA,3)>60),inc2(dat$Inertial.Vertical.spd.CA))
+  #idl=intersect(idp,idv)
+  #idl=intersect(which(diff(dat$pitch.agl,2)>0),inc3(dat$Inertial.Vertical.spd.CA,3))
+  #idlap1[i]=min(idl)
+  #hlap1[i]=dat$height[idlap1[i]]
+  #macc[i]=max(dat$maxacc[idlap[i]:17])
+  maxacc[i]=max(dat$maxacc[idlap[i]:18])
+  maxpitch[i]=max(dat$pitch.agl[idlap[i]:18])
+  maxroll[i]=max(abs(dat$roll.agl[idlap[i]:18]))
+}
+#实际拉平时长
+actt=numeric()
+actt=idlnd[valid[c(1:3299)[-idabnorm]]]-(idlap1[-3035:-3040]+id120[valid[c(1:3299)[-idabnorm]]]-1) #这个之前算错了...
+
+hlapold=numeric() #拉平分界点,以着陆前15s内一秒俯仰角增长超过0.5度且下一秒继续增长为判断标准
+for(i in 1:3034){
+  k=valid[c(1:3299)[-idabnorm][i]]
+  dat=a320[[k]][(idlnd[k]-10):idlnd[k],]
+  dif=diff(dat$pitch.agl)
+  hlapold[i]=dat$height[min(which(dif>=0.5 & c(dif[-1]>=0,FALSE)))]
+}
+#hlapold整体密度图
+ggplot(data.frame(hlapold),aes(x=hlapold))+geom_density(aes(fill=I("#6baed6"),col=I("#6baed6"),alpha=I(0.6)))+theme(plot.title=element_text(hjust=0.5))+labs(x="Actual Flare Height/ft",title="Density Plot of Actual Flare Height")+xlim(c(0,250))+geom_vline(xintercept=quantile(hlap1,c(0.25,0.75,0.95)),col="#8B7B8B",linetype=5)
+
+inc2=function(x){
+  idl=numeric()
+  for(i in 1:(length(x)-4)){
+    if(diff(x,2)[i]>0 && diff(x,2)[i+1]>0 && diff(x,2)[i+2]>0){idl=c(idl,i)}
+  }
+  return(idl)
+}
+inc3=function(x){
+  idl=numeric()
+  for(i in 1:(length(x)-3)){
+    if(diff(x)[i]>=0 && diff(x)[i+1]>=0 && diff(x)[i+2]>=0){idl=c(idl,i)}
+  }
+  return(idl)
+}
+inc4=function(x){
+  idl=numeric()
+  for(i in 1:(length(x)-4)){
+    if(diff(x)[i]>=0 && diff(x)[i+1]>=0 && diff(x)[i+2]>=0 && diff(x)[i+3]>=0){idl=c(idl,i)}
+  }
+  return(idl)
+}
+
+
+#真实拉平过程tau,v0拟合
+taut=numeric()
+v0t=numeric()
+for(i in 1:3034){ #439,1361,1750,2640,2795倒数第一秒速度为负
+  k=c(1:3299)[-idabnorm][i]
+    fitt=lm(v~h,data=data.frame(h=-hlast[idlap[i]:18,k],v=vylast[idlap[i]:18,k]/60))
+    taut[i]=1/fitt$coefficients[2]
+    v0t[i]=fitt$coefficients[1]*60  #转换为ft/min
+}
+
+
+#重着陆实际样本的数据提取
+addh=list.files("D:/THU PC/学习/科研/国航QAR/final/final vic/320系列重着陆导出数据/已清洗",full.names=TRUE)
+for(i in 1:6){
+  heavy320[[i]]=read.csv(addh[i],header=TRUE,stringsAsFactors=FALSE)[-1,-1:-2]
+  for(j in c(1:3,9:16,29:ncol(heavy320[[i]]))){
+    heavy320[[i]][,j]=as.numeric(heavy320[[i]][,j])
+  }
+  heavy320[[i]]$height=apply(heavy320[[i]][,9:12],MARGIN=1,FUN=mean)
+  heavy320[[i]]$pitch.agl=apply(heavy320[[i]][,41:44],MARGIN=1,FUN=mean)
+  heavy320[[i]]$maxacc=apply(heavy320[[i]][,32:39],MARGIN=1,FUN=max)
+}
+
+
+hlasth=data.frame(rep(NA,19))
+for(i in 1:6){
+  n=nrow(heavy320[[i]])
+  hlasth[,i]=-heavy320[[i]]$height[(n-23):(n-5)]
+}
+vylasth=data.frame(rep(NA,19))
+for(i in 1:6){
+  n=nrow(heavy320[[i]])
+  vylasth[,i]=-heavy320[[i]]$IVV_CA[(n-23):(n-5)]
+}
+alndh=numeric()
+for(i in 1:6){
+  n=nrow(heavy320[[i]])
+  alndh[i]=heavy320[[i]]$maxacc[n-5]
+}
+#真实拉平点位置判断,找真实拉平过程最大acc,真实拉平高度h
+id120h=numeric()
+for(i in 1:6){
+  n=nrow(heavy320[[i]])
+  #dat=heavy320[[i]][(n-23):(n-5),]
+  #dat=heavy320[[i]][1:(n-5),]
+  #id120h[i]=max(which(dat$height>120))+1
+  dat=heavy320[[i]][(id50h[i]+n-23-1):(n-5),]
+  #dat1=heavy320[[i]][id120h[i]:(n-5),]
+  #idp=intersect(which(diff(dat$pitch.agl)>0),which(diff(dat$pitch.agl,2)>0))
+  #idv=intersect(which(diff(dat$IVV_CA,3)>60),inc2(dat$IVV_CA))
+  #idl=intersect(idp,idv)
+  #idlap1[i+3034]=min(idl)
+  #hlap1[i+3034]=dat$height[idlap1[i+3034]]
+  #idl=which(diff(dat$IVV_CA)>0 & diff(dat$pitch.agl)>0)
+  #idlap[i+3034]=idl[min(which(idl>=id50h[i]))]
+  #hlap[i+3034]=dat$height[idlap[i+3034]]
+  #macc[i+3034]=max(dat$maxacc[idlap[i+3034]:17])
+  actt[i+3034]=(n-5)-(idlap1[i+3034]+id120h[i]-1)
+  maxacc[i+3034]=max(dat$maxacc[-nrow(dat)])
+  maxpitch[i+3034]=max(dat$pitch.agl[-nrow(dat)])
+  maxroll[i+3034]=max(abs(rowMeans(dat[-nrow(dat),61:62])))
+}
+#之前规则判断的拉平高度
+for(i in 1:6){
+  n=nrow(heavy320[[i]])
+  dat=heavy320[[i]][(n-15):(n-5),]
+  dif=diff(dat$pitch.agl)
+  hlapold[i+3034]=dat$height[min(which(dif>=0.5 & c(dif[-1]>=0,FALSE)))]
+}
+
+#真实拉平过程tau,v0拟合
+for(i in 1:6){
+  fitt=lm(v~h,data=data.frame(h=-hlasth[idlap[i+3034]:18,i],v=vylasth[idlap[i+3034]:18,i]/60))
+  taut[i+3034]=1/fitt$coefficients[2]
+  v0t[i+3034]=fitt$coefficients[1]*60  #转换为ft/min
+}
+
+
+id50h=numeric()  #找id50heavy
+id80h=numeric()
+id20h=numeric()
+for(i in 1:6){
+  id50h[i]=max(which(hlasth[,i]<(-50)))
+  id80h[i]=min(which(hlasth[,i]>(-80)))
+  id20h[i]=min(which(hlasth[,i]>(-20)))-1  #id20取达到20前的那个点
+}
+#拟合tauheavy,ti,tt,lambda
+for(i in 1:6){
+  #fit1=lm(v~h,data=data.frame(h=-hlasth[id50h[i]:18,i],v=vylasth[id50h[i]:18,i]/60))
+  #r2[i+3034]=summary(fit1)$r.square
+    fit=lm((v-50/60)~h-1,data=data.frame(h=-hlasth[id50h[i]:18,i],v=vylasth[id50h[i]:18,i]/60))
+    lambda[i+3034]=powerTransform(fit)$lambda
+    #tau[i+3034]=1/fit$coefficients[2]
+    #v0[i+3034]=fit$coefficients[1]*60  #转换为ft/min
+    #ti[i+3034]=tau[i+3034]*log(1-(hlasth[id50h[i],i]-hlasth[19,i])/v0[i+3034]/tau[i+3034]*60)#1-是因为hlast是负的
+    #tt[i+3034]=19-id50h[i]
+}
+
+#hlap1整体密度图
+ggplot(data.frame(hlap1),aes(x=hlap1))+geom_density(aes(fill=I("#6baed6"),col=I("#6baed6"),alpha=I(0.6)))+geom_vline(xintercept=quantile(hlap1,c(0.25,0.75,0.95)),col="#8B7B8B",linetype=5)+theme(plot.title=element_text(hjust=0.5))+labs(x="Actual Flare Height/ft",title="Density Plot of Actual Flare Height")+annotate("text",label="25%",x=4.5,y=0.45,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(tau,0.25),2),x=4.5,y=0.4,size=4.5,col="#8B7B8B") +annotate("text",label="75%",x=7.5,y=0.45,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(tau,0.75),2),x=7.5,y=0.4,size=4.5,col="#8B7B8B") +annotate("text",label="95%",x=9,y=0.45,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(tau,0.95),2),x=9,y=0.4,size=4.5,col="#8B7B8B")
+
+
+
+#tau整体密度图
+library(ggplot2)
+library(ggridges)
+ggplot(data.frame(tau[-3035:-3040]),aes(x=tau[-3035:-3040]))+geom_density(aes(fill=I("#6baed6"),col=I("#6baed6"),alpha=I(0.6)))+geom_vline(xintercept=quantile(tau,c(0.25,0.75,0.95)),col="#8B7B8B",linetype=5)+annotate("text",label="25%",x=4.5,y=0.45,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(tau,0.25),2),x=4.5,y=0.4,size=4.5,col="#8B7B8B") +annotate("text",label="75%",x=7.5,y=0.45,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(tau,0.75),2),x=7.5,y=0.4,size=4.5,col="#8B7B8B") +annotate("text",label="95%",x=9,y=0.45,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(tau,0.95),2),x=9,y=0.4,size=4.5,col="#8B7B8B") +theme(plot.title=element_text(hjust=0.5))+labs(x="Tau/s",title="Density Plot of Tau")+xlim(c(1,15))
+#整体tau不同level下着陆情况密度图
+taulev=rep("med",3034)
+taulev[which(tau[-3035:-3040]<quantile(tau[-3035:-3040],0.25))]="low"
+taulev[which(tau[-3035:-3040]>quantile(tau[-3035:-3040],0.95))]="extremely high"
+taulev[which(tau[-3035:-3040]>=quantile(tau[-3035:-3040],0.75)&tau[-3035:-3040]<quantile(tau[-3035:-3040],0.95))]="high"
+taulev=factor(taulev,levels=c("low","med","high","extremely high"),labels=c("low","med","high","extremely high"))
+
+ggplot(data.frame(vylast[19,-idabnorm]),aes(x=vylast[19,-idabnorm],y=taulev,fill=taulev,col=taulev))+geom_density_ridges(alpha=0.4)+theme_ridges()+theme(plot.title=element_text(hjust=0.5))+labs(x="Vylnd(ft/min)",y="Tau Level",title="Density Plot of Vylnd")+scale_fill_manual(values = c("#66CD00","#009ACD","#6959CD","#DAA520"))+scale_color_manual(values = c("#66CD00","#009ACD","#6959CD","#DAA520"))+geom_vline(xintercept=quantile(vylast[19,-idabnorm],0.95),col="#8B7B8B",linetype=5)+annotate("text", label="95%",x=320,y=5.5, size=4.5,col="#8B7B8B")+annotate("text", label=round(quantile(vylast[19,-idabnorm],0.95)),x=320,y=5.1, size=4.5,col="#8B7B8B")
+
+ggplot(data.frame(alnd[-idabnorm]),aes(x=alnd[-idabnorm],y=taulev,fill=taulev,col=taulev))+geom_density_ridges(alpha=0.4)+theme_ridges()+theme(plot.title=element_text(hjust=0.5))+labs(x="Alnd(g)",y="Tau Level",title="Density Plot of Alnd")+scale_fill_manual(values = c("#66CD00","#009ACD","#6959CD","#DAA520"))+scale_color_manual(values = c("#66CD00","#009ACD","#6959CD","#DAA520"))+geom_vline(xintercept=quantile(alnd[-idabnorm],0.95),col="#8B7B8B",linetype=5)+annotate("text", label="95%",x=1.5,y=5.5, size=4.5,col="#8B7B8B")+annotate("text", label=round(quantile(alnd[-idabnorm],0.95),2),x=1.5,y=5.1,size=4.5,col="#8B7B8B")
+
+
+#ti,tt,tau之间散点图
+ifhigh=rep("fair",3034)
+idvhi=which(vylast[19,-idabnorm]>380)  #着陆速度超过380ft/min
+#idahi=which(alnd[-idabnorm]>quantile(alnd[-idabnorm],0.99))
+idahi=which(alnd[-idabnorm]>1.6)   #着陆垂直过载超过1.6g
+#idmaxahi=which(macc>1.35)   #空中垂直过载超过1.35g
+ifhigh[idvhi]="High Vylnd"
+ifhigh[idahi]="High Alnd"
+#ifhigh[idmaxahi]="High MaxAcc in Air"
+ifhigh[3035:3040]="hard landing"
+ifhigh=factor(ifhigh,levels=c("High Alnd","High Vylnd","fair","hard landing"))
+alpha=rep(0.8,3040)
+alpha[which(ifhigh=="fair")]=0.1
+cex=rep(2,3040)
+cex[which(ifhigh=="fair")]=1
+label=c(clust5$class,c(6,6,6,3,6,6))
+label[which(ifhigh=="fair")]=NA
+ggplot(data.frame(hlap1=hlap1,taut=taut,ifHardLanding=ifhigh),aes(x=taut,y=hlap1,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Actual Tau",y="Actual Flare Height",title="Actual Flare Height VS Actual Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))+xlim(c(4,20))
+ggplot(data.frame(macc=macc,taut=taut,ifHardLanding=ifhigh),aes(x=taut,y=macc,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Actual Tau",y="MaxAcc in air",title="MaxAcc in air VS Actual Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(alnd=c(alnd[-idabnorm],alndh),taut=taut,ifHardLanding=ifhigh),aes(x=taut,y=alnd,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Actual Tau",y="Alnd",title="Alnd VS Actual Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(taut=taut,v0t=v0t,ifHardLanding=ifhigh),aes(x=taut,y=v0t,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Actual Tau",y="Actual FittedVylnd",title="Actual FittedVylnd VS Actual Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+
+#ti,tt,v0,tau之间散点图
+ggplot(data.frame(ti=ti,tt=tt,ifHardLanding=ifhigh),aes(x=ti,y=tt,col=ifHardLanding))+geom_point(aes(alpha=I(alpha),cex=I(cex)))+labs(x="Ref t",y="Actual t",title="Actual t VS Ref t")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+#+scale_color_manual(values=c("#EEEE00","#B23AEE","#FF6A6A","#78c679","#5CACEE"))
+ggplot(data.frame(ti=ti,tau=tau,ifHardLanding=ifhigh),aes(x=tau,y=ti,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="Ref t",title="Ref t VS Tau")+theme(plot.title=element_text(hjust=0.5))+ylim(c(5,12.5))+xlim(c(4,15))
+ggplot(data.frame(tt=tt,tau=tau,ifHardLanding=ifhigh),aes(x=tau,y=tt,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="Actual t",title="Actual t VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(tt=tt,v0=v0,ifHardLanding=ifhigh),aes(x=v0,y=tt,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Fitted Vylnd",y="Actual t",title="Actual t VS Fitted Vylnd")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(tt=tt,lambda=lambda,ifHardLanding=ifhigh),aes(x=lambda,y=tt,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Lambda",y="Actual t",title="Actual t VS Lambda")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(v0=v0,actv=c(t(vylast[19,-idabnorm]),t(vylasth[19,])),ifHardLanding=ifhigh),aes(x=v0,y=actv,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Fitted Vylnd",y="Actual Vylnd",title="Actual Vylnd VS Fitted Vylnd")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(p=tt/tau,actv=c(t(vylast[19,-idabnorm]),t(vylasth[19,])),ifHardLanding=ifhigh),aes(x=actv,y=p,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Actual Vylnd",y="Actual t/Tau",title="Actual t/Tau VS Actual Vylnd")+theme(plot.title=element_text(hjust=0.5))
+ggplot(data.frame(tau=tau,actv=c(t(vylast[19,-idabnorm]),t(vylasth[19,])),ifHardLanding=ifhigh),aes(x=tau,y=actv,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="Actual Vylnd",title="Actual Vylnd VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(lambda=lambda,actv=c(t(vylast[19,-idabnorm]),t(vylasth[19,])),ifHardLanding=ifhigh),aes(x=lambda,y=actv,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Lambda",y="Actual Vylnd",title="Actual Vylnd VS Lambda")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(p=v0*tau,actv=c(t(vylast[19,-idabnorm]),t(vylasth[19,])),ifHardLanding=ifhigh),aes(x=actv,y=p,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Actual Vylnd",y="Fitted Vylnd*Tau",title="Fitted Vylnd*Tau VS Actual Vylnd")+theme(plot.title=element_text(hjust=0.5))+xlim(c(-100,450))+ylim(c(0,6000))+geom_text(aes(label=label,alpha=I(alpha)),nudge_x=0.2,col="black",size=2)
+
+##fitted vy,tau,r2两两关系图
+#length(which(v0>500))  找各个参数合适边界
+#length(which(tau>20))
+#length(which(r2<0.6))
+ggplot(data.frame(v0=v0,tau=tau,ifHardLanding=ifhigh),aes(x=tau,y=v0,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="Fitted Vylnd",title="Fitted Vylnd VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))+geom_segment(aes(x=14,xend=14,y=0,yend=500,size=1),col="grey50")+geom_segment(aes(x=0,xend=14,y=500,yend=500,size=1),col="grey50")
+ggplot(data.frame(tau=tau,r2=r2,ifHardLanding=ifhigh),aes(x=tau,y=r2,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="R2",title="R2 VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))+geom_segment(aes(x=14,xend=14,y=0.6,yend=1,size=1),col="grey50")+geom_segment(aes(x=0,xend=14,y=0.6,yend=0.6,size=1),col="grey50")
+ggplot(data.frame(v0=v0,r2=r2,ifHardLanding=ifhigh),aes(x=r2,y=v0,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="R2",y="Fitted Vylnd",title="Fitted Vylnd VS R2")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))+geom_segment(aes(x=0.6,xend=0.6,y=0,yend=500,size=1),col="grey50")+geom_segment(aes(x=0.6,xend=1,y=500,yend=500,size=1),col="grey50")
+
+#lambda和tau,v0,r2散点图
+#length(which(lambda>5.5))  找各个参数合适边界
+ggplot(data.frame(tau=tau,lambda=lambda,ifHardLanding=ifhigh),aes(x=tau,y=lambda,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="Lambda",title="Lambda VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))+geom_segment(aes(x=14,xend=14,y=0,yend=6,size=1),col="grey50")+geom_segment(aes(x=0,xend=14,y=6,yend=6,size=1),col="grey50")
+ggplot(data.frame(v0=v0,lambda=lambda,ifHardLanding=ifhigh),aes(x=v0,y=lambda,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Fitted Vylnd",y="Lambda",title="Lambda VS Fitted Vylnd")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))+geom_segment(aes(x=500,xend=500,y=0,yend=6,size=1),col="grey50")+geom_segment(aes(x=0,xend=500,y=6,yend=6,size=1),col="grey50")
+ggplot(data.frame(r2=r2,lambda=lambda,ifHardLanding=ifhigh),aes(x=r2,y=lambda,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="R2",y="Lambda",title="Lambda VS R2")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))+geom_segment(aes(x=0.6,xend=0.6,y=0,yend=6,size=1),col="grey50")+geom_segment(aes(x=0.6,xend=1,y=6,yend=6,size=1),col="grey50")
+
+#alnd和tau,v0,r2,lambda散点图
+ggplot(data.frame(alnd=c(alnd[-idabnorm],alndh),tau=tau,ifHardLanding=ifhigh),aes(x=tau,y=alnd,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="Alnd",title="Alnd VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(alnd=c(alnd[-idabnorm],alndh),v0=v0,ifHardLanding=ifhigh),aes(x=v0,y=alnd,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Fitted Vylnd",y="Alnd",title="Alnd VS Fitted Vylnd")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(alnd=c(alnd[-idabnorm],alndh),lambda=lambda,ifHardLanding=ifhigh),aes(x=lambda,y=alnd,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="R2",y="Alnd",title="Alnd VS R2")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(alnd=c(alnd[-idabnorm],alndh),lambda=lambda,ifHardLanding=ifhigh),aes(x=lambda,y=alnd,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Lambda",y="Alnd",title="Alnd VS Lambda")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+
+#Vylnd和tau,v0,r2,lambda散点图
+ggplot(data.frame(vlnd=vylnd,tau=tau,ifHardLanding=ifhigh),aes(x=tau,y=vlnd,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="Vylnd",title="Vylnd VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(vlnd=vylnd,v0=v0,ifHardLanding=ifhigh),aes(x=v0,y=vlnd,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Fitted Vylnd",y="Vylnd",title="Vylnd VS Fitted Vylnd")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(vlnd=vylnd,lambda=lambda,ifHardLanding=ifhigh),aes(x=lambda,y=vlnd,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="R2",y="Vylnd",title="Vylnd VS R2")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(vlnd=vylnd,lambda=lambda,ifHardLanding=ifhigh),aes(x=lambda,y=vlnd,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Lambda",y="Vylnd",title="Vylnd VS Lambda")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+
+##macc和tau,v0,r2,lambda散点图
+ggplot(data.frame(macc=macc,tau=tau,ifHardLanding=ifhigh),aes(x=tau,y=macc,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="MaxAcc",title="MaxAcc in Air VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(macc=macc,v0=v0,ifHardLanding=ifhigh),aes(x=v0,y=macc,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Fitted Vylnd",y="MaxAcc",title="MaxAcc in Air VS Fitted Vylnd")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(macc=macc,r2=r2,ifHardLanding=ifhigh),aes(x=r2,y=macc,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="R2",y="MaxAcc",title="MaxAcc in Air VS R2")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(macc=macc,lambda=lambda,ifHardLanding=ifhigh),aes(x=lambda,y=macc,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Lambda",y="MaxAcc",title="MaxAcc in Air VS Lambda")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+
+##maxpitch和tau,v0,r2,lambda散点图
+ggplot(data.frame(map=maxpitch,tau=tau,ifHardLanding=ifhigh),aes(x=tau,y=map,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="MaxPitch",title="MaxPitch in Air VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(map=maxpitch,v0=v0,ifHardLanding=ifhigh),aes(x=v0,y=map,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Fitted Vylnd",y="MaxPitch",title="MaxPitch in Air VS Fitted Vylnd")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(map=maxpitch,r2=r2,ifHardLanding=ifhigh),aes(x=r2,y=map,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="R2",y="MaxPitch",title="MaxPitch in Air VS R2")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(map=maxpitch,lambda=lambda,ifHardLanding=ifhigh),aes(x=lambda,y=map,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Lambda",y="MaxPitch",title="MaxPitch in Air VS Lambda")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+
+##maxroll和tau,v0,r2,lambda散点图
+ggplot(data.frame(map=maxroll,tau=tau,ifHardLanding=ifhigh),aes(x=tau,y=map,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="MaxRoll",title="MaxRoll in Air VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(map=maxroll,v0=v0,ifHardLanding=ifhigh),aes(x=v0,y=map,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Fitted Vylnd",y="MaxRoll",title="MaxRoll in Air VS Fitted Vylnd")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(map=maxroll,r2=r2,ifHardLanding=ifhigh),aes(x=r2,y=map,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="R2",y="MaxRoll",title="MaxRoll in Air VS R2")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(map=maxroll,lambda=lambda,ifHardLanding=ifhigh),aes(x=lambda,y=map,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Lambda",y="MaxRoll",title="MaxRoll in Air VS Lambda")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+
+
+
+##实际拉平高度hlap1和tau,v0,r2,lambda散点图
+ggplot(data.frame(hlap1=hlap1,tau=tau,ifHardLanding=ifhigh),aes(x=tau,y=hlap1,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="Actual Flare Height",title="Actual Flare Height VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(hlap1=hlap1,v0=v0,ifHardLanding=ifhigh),aes(x=v0,y=hlap1,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Fitted Vylnd",y="Actual Flare Height",title="Actual Flare Height VS Fitted Vylnd")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(hlap1=hlap1,r2=r2,ifHardLanding=ifhigh),aes(x=r2,y=hlap1,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="R2",y="Actual Flare Height",title="Actual Flare Height VS R2")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(hlap1=hlap1,lambda=lambda,ifHardLanding=ifhigh),aes(x=lambda,y=hlap1,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Lambda",y="Actual Flare Height",title="Actual Flare Height VS Lambda")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+
+##实际拉平时长和tau,v0,r2,lambda散点图
+ggplot(data.frame(actt=actt,tau=tau,ifHardLanding=ifhigh),aes(x=tau,y=actt,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="Actual Flare Time",title="Actual Flare Time VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(actt=actt,v0=v0,ifHardLanding=ifhigh),aes(x=v0,y=actt,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Fitted Vylnd",y="Actual Flare Time",title="Actual Flare Time VS Fitted Vylnd")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(actt=actt,r2=r2,ifHardLanding=ifhigh),aes(x=r2,y=actt,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="R2",y="Actual Flare Time",title="Actual Flare Time VS R2")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+ggplot(data.frame(actt=actt,lambda=lambda,ifHardLanding=ifhigh),aes(x=lambda,y=actt,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Lambda",y="Actual Flare Time",title="Actual Flare Time VS Lambda")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))
+
+
+
+
+##带上reft等高线contour的v0-tau图
+ggplot(data.frame(tau=tau,v0=v0,ifHardLanding=ifhigh,ti=ti),aes(x=tau,y=v0,col=ti,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="Fitted Vylnd",title="Fitted Vylnd VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_colour_gradient2(high="#FF4040",low="#a6d96a",mid="#4575b4",midpoint=9)+xlim(c(4,12))
+
+ggplot(data.frame(tau=tau,v0=v0,ifHardLanding=ifhigh,ti=ti),aes(x=tau,y=v0,col=ti,z=ti,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Tau",y="Fitted Vylnd",title="Fitted Vylnd VS Tau")+theme(plot.title=element_text(hjust=0.5))+scale_colour_gradient2(high="#FF4040",low="#a6d96a",mid="#4575b4",midpoint=9)+geom_contour()+xlim(c(4,12))
+contour(x=tau,y=v0,z=ti,nlevels=10)
+library(gg3D)
+theta=45 #方位角的度数
+phi=50 # 渐近线
+ggplot(data.frame(tau=tau,v0=v0,ifHardLanding=ifhigh,ti=ti), aes(x=tau, y=v0, z=ti, color=ti,alpha=I(0.1))) +axes_3D(theta=theta, phi=phi) + stat_3D(theta=theta, phi=phi) +axis_labs_3D(theta=theta,phi=phi,size=3,hjust=c(1,1,1.2,1.2,1.2,1.2),vjust=c(-.5,-.5,-.2,-.2,1.2,1.2)) +labs_3D(theta=theta, phi=phi, hjust=c(1,0,0), vjust=c(1.5,1,-.2),labs=c("Tau", "Fitted Vylnd", "Ref t")) +theme_void()+scale_colour_gradient2(high="#FF4040",low="#a6d96a",mid="#4575b4",midpoint=9)
+library(rgl)
+plot3d(x=tau,y=v0,z=ti,clo="cc",size=1)
+interleave=function(v1, v2){
+  as.vector(rbind(v1,v2))
+}
+plot3d(x=tau,y=v0,z=lambda,type="s",size=0.5,lit=FALSE)
+segments3d(interleave(tau, tau),interleave(v0, v0),interleave(lambda,rep(1,3040)),alpha=0.4, col="red")
+
+alpha=rep(0.8,3040)
+alpha[which(ifhigh=="fair")]=0.3
+alpha1=rep(0,3040)
+alpha1[which(ifhigh==">99% quantile of Vylnd")]=0.6
+alpha2=rep(0,3040)
+alpha2[which(ifhigh=="hard landing")]=0.8
+actv=c(t(vylast[19,-idabnorm]),t(vylasth[19,]))
+vcol=rep(200,3040)
+vcol[which(vylast[19,-idabnorm]>200)]=actv[which(vylast[19,-idabnorm]>200)]
+vcol[which(ifhigh==">99% quantile of Vylnd")]=200
+ggplot(data.frame(tau=tau,v0=v0,ifHardLanding=ifhigh,vcol=vcol),aes(x=tau,y=v0,cex=I(cex)))+geom_point(aes(col=vcol,alpha=I(alpha)))+labs(x="Tau",y="Fitted Vylnd",title="Fitted Vylnd VS Tau")+theme(plot.title=element_text(hjust=0.5))+geom_point(aes(alpha=I(alpha1)),col="yellow")+geom_point(aes(alpha=I(alpha2)))+scale_colour_gradient2(high="#d7191c",low="#a6d96a",mid="#4575b4",midpoint=235)+xlim(c(4,12))+geom_text(aes(label=label,alpha=I(alpha)),nudge_x=0,col="black",size=2)
+```
+
+#以tau和fittedvy两个特征SVM分类是否高下沉率航班
+```{r}
+library(e1071)
+id=which(v0[-3035:-3040]>240)
+modelsvm=svm(x=data.frame(fitvy=v0[id],tau=tau[id]),y=ifhigh[id],kernel="polynomial",degree=2)
+```
+
+
+##代表航班图
+```{r}
+k=1754
+k=616
+k=1717
+id=c(which(ifhigh=="fair, High tau/v0/lambda"),616)
+id=c(797,45,73)
+id=c(1580,1841,616)
+#v-h图
+for(k in id){
+  i=c(1:3299)[-idabnorm][k]
+  plot(x=hlast[,i],y=vylast[,i],xlim=c(-70,0),ylim=c(-16,900),type="l",col=1,cex=0.8,xlab="Height",ylab="Vy",main=paste("id:",k))
+  points(x=hlast[,i],y=vylast[,i],col=1,cex=0.8)
+  #lines(x=hlast[,i],y=vylast[,i]^lambda[k],col=1,cex=0.8)
+  #points(x=hlast[,i],y=vylast[,i]^lambda[k],col=1,cex=0.8)
+  text(x=-60,y=500,paste("lambda:",lambda[k]))
+}
+
+id=c(2079,2170)
+for(j in 1:length(id)){
+k=2000
+#426 1337 1442 1485 1580 1685 2672 3036 3037 3039
+i=valid[c(1:3299)[-idabnorm][k]]
+id250=max(which(a320[[i]][1:idlnd[i],"height"]>250))
+#dat=a320[[i]][(idlnd[i]-18+id80[i]-1):(idlnd[i]+5),]
+#lnd=19-id80[i]+1
+#lap=id50[i]-id80[i]+1  #认为50前的第一个点为拉平点
+#time=1:(19-id80[i]+1+5)  #从80ft画到着陆点后5s
+#dat=a320[[i]][id120[i]:(idlnd[i]+5),]
+#lnd=idlnd[i]-id120[i]+1
+#lap=id50[i]+idlnd[i]-18-1-id120[i]+1  #认为50前的第一个点为拉平点
+dat=a320[[i]][id250:(idlnd[i]+5),]
+lnd=idlnd[i]-id250+1
+lap=id50[i]+idlnd[i]-18-1-id250+1
+time=1:(lnd+5)  #从80ft画到着陆点后5s
+
+plot(time, dat$height, type = "o", ylim=c(0, 900), cex=0.8, axes=FALSE, ylab="Radio Height and Vertical Speed", main=paste("id:",k))
+#}
+points(time[lnd], dat$height[lnd], col="red", pch=19,cex=0.8)
+points(time[lap], dat$height[lap], col="blue", pch=19,cex=0.8)
+axis(2, ylim=c(0,900),col="black",las=1)
+box()
+
+## add leveling height
+lines(c(0, length(time)), rep(dat$height[lap],2), col="blue", lwd=0.3)
+text(1.5, dat$height[lap]+5, round(dat$height[lap]), cex=0.6)
+
+## add reference trajectory before leveling point
+#lines(c(1, time[lap]), c(dat$height[1], dat$height[lap]), lty="dotted", col="grey50")
+## add reference trajectory after leveling point
+timeplus <- seq(0, length(time)-time[lap], 0.1)
+#pathplus <- (dat$height[lap]-dat$height[lnd])*exp(-timeplus/tau[k])-v0[k]*tau[k]*(1-exp(-timeplus/tau[k]))+dat$height[lnd]
+#lines(time[lap]+timeplus, pathplus, lty="dotted", col="grey50")
+
+# add inertia vertical speed
+lines(time, -dat$Inertial.Vertical.spd.CA)
+points(time, -dat$Inertial.Vertical.spd.CA, pch=2, cex=0.6)
+points(time[lnd], -dat$Inertial.Vertical.spd.CA[lnd], col="red", pch=17, cex=0.8)
+points(time[lap], -dat$Inertial.Vertical.spd.CA[lap], col="blue", pch=17, cex=0.8)
+
+## add reference vertical speed before leveling point
+# <- (dat$height[1] - dat$height[lap])/(time[lap] - 1)*60
+#lines(c(1, time[lap]), rep(RefSpd,2), lty="dotted", col="grey50")
+#text(1.5, RefSpd+20, round(RefSpd,0), cex=0.6)
+#text(time[lap], -dat$Inertial.Vertical.spd.CA[lap]-40, round(-dat$Inertial.Vertical.spd.CA[lap]), cex=0.6, col="blue")
+#text(time[lnd], -dat$Inertial.Vertical.spd.CA[lnd]-40, round(-dat$Inertial.Vertical.spd.CA[lnd]), cex=0.6, col="red")
+
+# add reference vertical speed after leveling point
+spdplus <- (v0[k]+(dat$height[lap]-dat$height[lnd])/tau[k]*60)*exp(-timeplus/tau[k])
+#}
+lines(time[lap]+timeplus, spdplus, lty="dotted", col="grey50")
+
+# add reference leveling time and landing speed
+RealTimeLand <- time[lnd]-time[lap]
+RefTimeLand <- tau[k]*log(1+(dat$height[lap]-dat$height[lnd])/tau[k]/v0[k]*60)
+RefSpdLand <- v0[k]
+#}
+
+lines(c(time[lap]+RefTimeLand, time[lap]+RefTimeLand), c(0,900), col="orange")
+text(2, 250, paste("real lev time", round(RealTimeLand,1)),cex=0.7)
+text(2, 200, paste("ref lev time", round(RefTimeLand,1)),cex=0.7,col="orange")
+text(time[lnd], 250, paste("real land spd", round(-dat$Inertial.Vertical.spd.CA[lnd])),cex=0.7)
+text(time[lnd], 200, paste("fitted land spd", round(RefSpdLand)),cex=0.7,col="orange")
+text(2, 300, paste("real land accel", round(dat$maxacc[lnd],2)),cex=0.7)
+text(2, 350, paste("real max accel in air", round(macc[k],2)),cex=0.7)
+text(2, 600, "airspeed (kts) * 4",cex=0.7,col="pink")
+text(3, 800, paste("tau",round(tau[k],2)),cex=0.7)
+text(3, 850, paste("lambda",round(lambda[k],1)),cex=0.7)
+
+# add airspeed
+lines(time, rowMeans(dat[,42:43])*4, col="pink")
+points(time, rowMeans(dat[,42:43])*4, col="pink", pch=17, cex=0.6)
+
+## Allow a second plot on the same graph
+par(new=TRUE)
+
+# plot pitch angle
+plot(time, dat$pitch.agl, type = "o", axes=FALSE, ylim=c(-10,10), col="purple", cex=0.5,ylab="",xlab="")
+points(time[lnd], dat$pitch.agl[lnd], col="red", pch=19, cex=0.5)
+points(time[lap], dat$pitch.agl[lap], col="blue", pch=19, cex=0.5)
+
+# plot acceleration
+#time8=c(1:((idlnd[i]-id80[i]+1+5)*8))/8
+#Accel=unlist(dat[,14:21])
+points(time, dat$maxacc, col="turquoise4", pch=19, cex=0.5, type="o")
+lines(time, dat$maxacc, col="turquoise4")
+points(time[lnd], dat$maxacc[lnd], col="red", pch=19, cex=0.5)
+# lines(time, AccelAve*5)
+
+# plot command
+CaptPitchComAve=rowMeans(dat[,22:29])
+FOPitchComAve=rowMeans(dat[,30:37])
+lines(time, CaptPitchComAve, col="red")
+lines(time, FOPitchComAve, col="green")
+mtext("Pitch Angle and Command",side=4,line=4) 
+axis(4, ylim=c(-10,10), las=1)
+axis(1,pretty(range(time),10))
+}
+##画图结束。
+```
+
+
+
+##代表航班图,50ft&真实tau,v0在一起
+```{r}
+#lambda拟合效果v-h图检验
+id=sample(1:3034,3,replace=FALSE)
+id=c(32,2529,938,2497,262,1429)
+id=77
+id=c(2339,2290)
+for(k in id){
+  i=c(1:3299)[-idabnorm][k]
+  j=valid[i]
+  plot(x=hlast[,i],y=vylast[,i],xlim=c(-70,0),ylim=c(-16,900),type="p",col=c(rep(1,18),"white"),cex=0.8,xlab="Height",ylab="Vy",main=paste("id",k," V-H"))
+  lines(x=hlast[-19,i],y=vylast[-19,i],col=1,cex=0.8)
+  points(x=hlast[19,i],y=vylast[19,i],col=1,cex=0.8,pch=2)
+  fit=lm(v~h-1,data=data.frame(v=((vylast[id50[j]:19,i]/60-50/60)^lambda[k]-1)/lambda[k],h=-hlast[id50[j]:19,i]))
+  lines(x=hlast[id50[j]:19,i],y=(predict(fit)*lambda[k]+1)^(1/lambda[k])*60+50,col=2,cex=0.8)
+  points(x=hlast[id50[j]:19,i],y=(predict(fit)*lambda[k]+1)^(1/lambda[k])*60+50,col=2,cex=0.8)
+  
+  fit1=lm(v~h,data=data.frame(v=vylast[id50[j]:18,i]/60,h=-hlast[id50[j]:18,i]))
+  lines(x=hlast[id50[j]:18,i],y=fit1$fitted.values*60,col="grey50",cex=1)
+  text(x=-60,y=800,paste("tau:",round(tau[k],2)))
+  text(x=-60,y=700,paste("beta0:",round(v0[k],2)))
+  #text(x=-60,y=600,paste("R2:",round(r2[k],2)))
+  text(x=-60,y=500,paste("lambda:",round(lambda[k],2)))
+}
+
+
+
+k=1754
+k=616
+k=1717
+id=c(which(ifhigh=="fair, High tau/v0/lambda"),616)
+id=c(797,45,73)
+id=c(1580,1841,616)
+#v-h图
+for(k in id){
+  i=c(1:3299)[-idabnorm][k]
+  plot(x=hlast[,i],y=vylast[,i],xlim=c(-70,0),ylim=c(-16,900),type="l",col=1,cex=0.8,xlab="Height",ylab="Vy",main=paste("id:",k))
+  points(x=hlast[,i],y=vylast[,i],col=1,cex=0.8)
+  #lines(x=hlast[,i],y=vylast[,i]^lambda[k],col=1,cex=0.8)
+  #points(x=hlast[,i],y=vylast[,i]^lambda[k],col=1,cex=0.8)
+  text(x=-60,y=500,paste("lambda:",lambda[k]))
+}
+
+
+
+id=c(302,443,2124,2151,2607,2850,1580,1841,616)
+id=which(count$percent>0.7)
+##40  56 200 205
+id=56
+idplot=2000
+for(k in idplot){
+#k=1
+#426 1337 1442 1485 1580 1685 2672 3036 3037 3039
+i=valid[c(1:3299)[-idabnorm][k]]
+#dat=a320[[i]][(idlnd[i]-18+id80[i]-1):(idlnd[i]+5),]
+#lnd=19-id80[i]+1
+#lap=id50[i]-id80[i]+1  #认为50前的第一个点为拉平点
+#time=1:(19-id80[i]+1+5)  #从80ft画到着陆点后5s
+dat=a320[[i]][id120[i]:(idlnd[i]+5),]
+lnd=idlnd[i]-id120[i]+1
+lap=id50[i]+idlnd[i]-18-1-id120[i]+1  #认为50前的第一个点为拉平点
+lapt=idlap[k]+idlnd[i]-18-1-id120[i]+1  #真实tau拟合点
+lap1=idlap1[k]  #真实拉平点
+time=1:(lnd+5)  #从80ft画到着陆点后5s
+
+plot(time, dat$height, type = "o", ylim=c(0, 900), cex=0.8, axes=FALSE, ylab="Radio Height and Vertical Speed", main=paste("id:",k))
+#}
+points(time[lnd], dat$height[lnd], col="red", pch=19,cex=0.8)
+points(time[lap1], dat$height[lap1], col="blue", pch=19,cex=0.8)
+points(time[lap], dat$height[lap], col="grey50", pch=19,cex=0.8)
+points(time[lapt], dat$height[lapt], col="orange", pch=19,cex=0.8)
+axis(2, ylim=c(0,900),col="black",las=1)
+box()
+
+## add leveling height
+lines(c(0, length(time)), rep(dat$height[lap1],2), col="blue", lwd=0.3)
+text(1.5, dat$height[lap1]+5, round(dat$height[lap1]), cex=0.6)
+
+## add reference trajectory before leveling point
+#lines(c(1, time[lap]), c(dat$height[1], dat$height[lap]), lty="dotted", col="grey50")
+## add reference trajectory after leveling point
+timeplus <- seq(0, length(time)-time[lap], 0.1)
+timeplust <- seq(0, length(time)-time[lapt], 0.1)
+#pathplus <- (dat$height[lap]-dat$height[lnd])*exp(-timeplus/tau[k])-v0[k]*tau[k]*(1-exp(-timeplus/tau[k]))+dat$height[lnd]
+#lines(time[lap]+timeplus, pathplus, lty="dotted", col="grey50")
+
+# add inertia vertical speed
+lines(time, -dat$Inertial.Vertical.spd.CA)
+points(time, -dat$Inertial.Vertical.spd.CA, pch=2, cex=0.6)
+points(time[lnd], -dat$Inertial.Vertical.spd.CA[lnd], col="red", pch=17, cex=0.8)
+points(time[lap1], -dat$Inertial.Vertical.spd.CA[lap1], col="blue", pch=17, cex=0.8)
+points(time[lap], -dat$Inertial.Vertical.spd.CA[lap], col="grey50", pch=17, cex=0.8)
+points(time[lapt], -dat$Inertial.Vertical.spd.CA[lapt], col="orange", pch=17, cex=0.8)
+
+## add reference vertical speed before leveling point
+# <- (dat$height[1] - dat$height[lap])/(time[lap] - 1)*60
+#lines(c(1, time[lap]), rep(RefSpd,2), lty="dotted", col="grey50")
+#text(1.5, RefSpd+20, round(RefSpd,0), cex=0.6)
+#text(time[lap], -dat$Inertial.Vertical.spd.CA[lap]-40, round(-dat$Inertial.Vertical.spd.CA[lap]), cex=0.6, col="blue")
+#text(time[lnd], -dat$Inertial.Vertical.spd.CA[lnd]-40, round(-dat$Inertial.Vertical.spd.CA[lnd]), cex=0.6, col="red")
+
+# add reference vertical speed after leveling point
+spdplus <- (v0[k]+(dat$height[lap]-dat$height[lnd])/tau[k]*60)*exp(-timeplus/tau[k])
+#}
+lines(time[lap]+timeplus, spdplus, lty="dotted", col="grey50")
+spdplust <- (v0t[k]+(dat$height[lapt]-dat$height[lnd])/taut[k]*60)*exp(-timeplust/taut[k])
+#}
+lines(time[lapt]+timeplust, spdplust, lty="dotted", col="orange")
+
+
+# add reference leveling time and landing speed
+RealTimeLand <- time[lnd]-time[lap]
+RefTimeLand <- tau[k]*log(1+(dat$height[lap]-dat$height[lnd])/tau[k]/v0[k]*60)
+RefSpdLand <- v0[k]
+#}
+
+lines(c(time[lap]+RefTimeLand, time[lap]+RefTimeLand), c(0,900), col="grey50")
+text(2, 250, paste("real lev time", round(RealTimeLand,1)),cex=0.7)
+text(2, 200, paste("ref lev time", round(RefTimeLand,1)),cex=0.7,col="grey50")
+text(time[lnd], 250, paste("real land spd", round(-dat$Inertial.Vertical.spd.CA[lnd])),cex=0.7)
+text(time[lnd], 200, paste("fitted land spd", round(RefSpdLand)),cex=0.7,col="grey50")
+text(2, 300, paste("real land accel", round(dat$maxacc[lnd],2)),cex=0.7)
+text(2, 350, paste("real max accel in air", round(macc[k],2)),cex=0.7)
+text(2, 600, "airspeed (kts) * 4",cex=0.7,col="pink")
+text(3, 800, paste("tau",round(tau[k],2)),cex=0.7)
+#text(3, 850, paste("lambda",round(lambda[k],1)),cex=0.7)
+
+
+# add airspeed
+lines(time, rowMeans(dat[,42:43])*4, col="pink")
+points(time, rowMeans(dat[,42:43])*4, col="pink", pch=17, cex=0.6)
+
+## Allow a second plot on the same graph
+par(new=TRUE)
+
+# plot pitch angle
+plot(time, dat$pitch.agl, type = "o", axes=FALSE, ylim=c(-10,10), col="purple", cex=0.5,ylab="",xlab="")
+points(time[lnd], dat$pitch.agl[lnd], col="red", pch=19, cex=0.5)
+points(time[lap1], dat$pitch.agl[lap1], col="blue", pch=19, cex=0.5)
+points(time[lap], dat$pitch.agl[lap], col="grey50", pch=19, cex=0.5)
+points(time[lapt], dat$pitch.agl[lapt], col="orange", pch=19, cex=0.5)
+
+# plot acceleration
+#time8=c(1:((idlnd[i]-id80[i]+1+5)*8))/8
+#Accel=unlist(dat[,14:21])
+points(time, dat$maxacc, col="turquoise4", pch=19, cex=0.5, type="o")
+lines(time, dat$maxacc, col="turquoise4")
+points(time[lnd], dat$maxacc[lnd], col="red", pch=19, cex=0.5)
+# lines(time, AccelAve*5)
+
+# plot command
+CaptPitchComAve=rowMeans(dat[,22:29])
+FOPitchComAve=rowMeans(dat[,30:37])
+lines(time, CaptPitchComAve, col="red")
+lines(time, FOPitchComAve, col="green")
+mtext("Pitch Angle and Command",side=4,line=4) 
+axis(4, ylim=c(-10,10), las=1)
+axis(1,pretty(range(time),10))
+}
+##画图结束。
+```
+
+
+#真实重着陆样本,50ft&真实tau,v0在一起
+```{r}
+#重着陆v-h图,lambda拟合效果检验
+for(i in 1:6){
+  plot(x=hlasth[,i],y=vylasth[,i],xlim=c(-70,0),ylim=c(-16,900),type="p",col=c(rep(1,18),"white"),cex=0.8,xlab="Height",ylab="Vy",main=paste("heavy",i," V-H",sep=""))
+  lines(x=hlasth[-19,i],y=vylasth[-19,i],col=1,cex=0.8)
+  points(x=hlast[19,i],y=vylast[19,i],col=1,cex=0.8,pch=2)
+
+  fit=lm(v~h-1,data=data.frame(v=((c(vylasth[id50h[i]:18,i],51)/60-50/60)^lambda[i+3034]-1)/lambda[i+3034],h=-hlasth[id50h[i]:19,i]))
+  lines(x=hlasth[id50h[i]:19,i],y=(fit$fitted.values*lambda[i+3034]+1)^(1/lambda[i+3034])*60+50,col=2,cex=0.8)
+  points(x=hlasth[id50h[i]:19,i],y=(fit$fitted.values*lambda[i+3034]+1)^(1/lambda[i+3034])*60+50,col=2,cex=0.8)
+
+  fit1=lm(v~h,data=data.frame(v=vylasth[id50h[i]:18,i]/60,h=-hlasth[id50h[i]:18,i]))
+  lines(x=hlasth[id50h[i]:18,i],y=fit1$fitted.values*60,col="grey50",cex=1)
+  text(x=-60,y=800,paste("tau:",round(tau[i+3034],2)))
+  text(x=-60,y=700,paste("beta0:",round(v0[i+3034],2)))
+  text(x=-60,y=600,paste("R2:",round(r2[i+3034],2)))
+  text(x=-60,y=500,paste("lambda:",round(lambda[i+3034],2)))
+
+}
+
+plot(x=-h,y=v,xlim=c(-70,0),ylim=c(-16,900),type="l",col=1,cex=0.8,xlab="Height",ylab="Vy",main=paste("heavy",i," V-H",sep=""))
+points(x=-h,y=v,col=1,cex=0.8)
+fit=lm(v~h-1,data=data.frame(v=((v/60-50/60)^lam-1)/lam,h=h))
+lines(x=-h,y=(h*lam*fit$coefficients+1)^(1/lam)*60+50,col=2,cex=0.8)
+points(x=-h,y=(h*lam*fit$coefficients+1)^(1/lam)*60+50,col=2,cex=0.8)
+text(x=-60,y=500,paste("lambda:",lam))
+
+
+
+id=which(tt<6)[1:6]
+for(j in 1:length(id)){
+  i=id[j]
+  k=valid[c(1:3299)[-idabnorm][i]]
+  plot(x=hlast[,-idabnorm][,i],y=vylast[,-idabnorm][,i],xlim=c(-70,0),ylim=c(-16,900),type="l",col=1,cex=0.8,xlab="Height",ylab="Vy",main=paste("id:",i))
+  points(x=hlast[,-idabnorm][,i],y=vylast[,-idabnorm][,i],col=1,cex=0.8)
+  fit=lm(v~h-1,data=data.frame(v=(vylast[,-idabnorm][id50[k]:18,i]^lambda[i]-1)/lambda[i],h=-hlast[,-idabnorm][id50[k]:18,i]))
+  lines(x=hlast[,-idabnorm][id50[k]:18,i],y=(-hlast[,-idabnorm][id50[k]:18,i]*lambda[i]*fit$coefficients+1)^(1/lambda[i]),col=2,cex=0.8)
+  points(x=hlast[,-idabnorm][id50[k]:18,i],y=(-hlast[,-idabnorm][id50[k]:18,i]*lambda[i]*fit$coefficients+1)^(1/lambda[i]),col=2,cex=0.8)
+  text(x=-60,y=500,paste("lambda:",lambda[i]))
+}
+
+
+i=2
+n=nrow(heavy320[[i]])-5
+#dat=heavy320[[i]][(n-18+id80h[i]-1):(n+5),]
+#lnd=19-id80h[i]+1
+#lap=id50h[i]-id80h[i]+1  #认为50前的第一个点为拉平点
+#time=1:(19-id80h[i]+1+5)  #从80ft画到着陆点后5s
+dat=heavy320[[i]][id120h[i]:(n+5),]
+lnd=n-id120h[i]+1
+lap=id50h[i]+n-18-1-id120h[i]+1  #认为50前的第一个点为拉平点
+lapt=idlap[i+3034]+n-18-1-id120h[i]+1  #真实tau拟合点
+lap1=idlap1[i+3034]  #真实拉平点
+time=1:(lnd+5)  #从80ft画到着陆点后5s
+plot(time, dat$height, type = "o", ylim=c(0, 900), cex=0.8, axes=FALSE, ylab="Radio Height and Vertical Speed", main=paste("heavy",i,": ","B-6676",sep=""))
+#}
+points(time[lnd], dat$height[lnd], col="red", pch=19,cex=0.8)
+points(time[lap1], dat$height[lap1], col="blue", pch=19,cex=0.8)
+points(time[lap], dat$height[lap], col="grey50", pch=19,cex=0.8)
+points(time[lapt], dat$height[lapt], col="orange", pch=19,cex=0.8)
+axis(2, ylim=c(0,900),col="black",las=1)
+box()
+
+## add leveling height
+lines(c(0, length(time)), rep(dat$height[lap1],2), col="blue", lwd=0.3)
+text(1.5, dat$height[lap1]+5, round(dat$height[lap1]), cex=0.6)
+
+## add reference trajectory before leveling point
+#lines(c(1, time[lap]), c(dat$height[1], dat$height[lap]), lty="dotted", col="grey50")
+# add reference trajectory after leveling point
+timeplus <- seq(0, length(time)-time[lap], 0.1)
+timeplust <- seq(0, length(time)-time[lapt], 0.1)
+#pathplus <- (dat$height[lap]-dat$height[lnd])*exp(-timeplus/tau[i+3034])-v0[i+3034]*tau[i+3034]*(1-exp(-timeplus/tau[i+3034]))+dat$height[lnd]
+#lines(time[lap]+timeplus, pathplus, lty="dotted", col="grey50")
+
+# add inertia vertical speed
+lines(time, -dat$IVV_CA)
+points(time, -dat$IVV_CA, pch=2, cex=0.6)
+points(time[lnd], -dat$IVV_CA[lnd], col="red", pch=17, cex=0.8)
+points(time[lap1], -dat$IVV_CA[lap1], col="blue", pch=17, cex=0.8)
+points(time[lap], -dat$IVV_CA[lap], col="grey50", pch=17, cex=0.8)
+points(time[lapt], -dat$IVV_CA[lapt], col="orange", pch=17, cex=0.8)
+
+## add reference vertical speed before leveling point
+# <- (dat$height[1] - dat$height[lap])/(time[lap] - 1)*60
+#lines(c(1, time[lap]), rep(RefSpd,2), lty="dotted", col="grey50")
+#text(1.5, RefSpd+20, round(RefSpd,0), cex=0.6)
+#text(time[lap], -dat$Inertial.Vertical.spd.CA[lap]-40, round(-dat$Inertial.Vertical.spd.CA[lap]), cex=0.6, col="blue")
+#text(time[lnd], -dat$Inertial.Vertical.spd.CA[lnd]-40, round(-dat$Inertial.Vertical.spd.CA[lnd]), cex=0.6, col="red")
+
+# add reference vertical speed after leveling point
+spdplus <- (v0[i+3034]+(dat$height[lap]-dat$height[lnd])/tau[i+3034]*60)*exp(-timeplus/tau[i+3034])
+lines(time[lap]+timeplus, spdplus, lty="dotted", col="grey50")
+spdplust <- (v0t[i+3034]+(dat$height[lapt]-dat$height[lnd])/taut[i+3034]*60)*exp(-timeplust/taut[i+3034])
+lines(time[lapt]+timeplust, spdplust, lty="dotted", col="orange")
+
+# add reference leveling time and landing speed
+RealTimeLand <- time[lnd]-time[lap]
+RefTimeLand <- tau[i+3034]*log(1+(dat$height[lap]-dat$height[lnd])/tau[i+3034]/v0[i+3034]*60)
+RefSpdLand <- v0[i+3034]
+#}
+
+lines(c(time[lap]+RefTimeLand, time[lap]+RefTimeLand), c(0,900), col="grey50")
+text(2, 250, paste("real lev time", round(RealTimeLand,1)),cex=0.7)
+text(2, 200, paste("ref lev time", round(RefTimeLand,1)),cex=0.7,col="grey50")
+text(time[lnd], 250, paste("real land spd", round(-dat$IVV_CA[lnd])),cex=0.7)
+text(time[lnd], 200, paste("fitted land spd", round(RefSpdLand)),cex=0.7,col="grey50")
+text(2, 300, paste("real land accel", round(dat$maxacc[lnd],2)),cex=0.7)
+text(2, 350, paste("real max accel in air", round(macc[i+3034],2)),cex=0.7)
+text(2, 600, "airspeed (kts) * 4",cex=0.7,col="pink")
+text(3, 800, paste("tau",round(tau[i+3034],2)),cex=0.7)
+text(3, 850, paste("lambda",round(lambda[i+3034],2)),cex=0.7)
+text(3, 900, paste("R2",round(r2[i+3034],2)),cex=0.7)
+
+# add airspeed
+lines(time, dat$IAS*4, col="pink")
+points(time, dat$IAS*4, col="pink", pch=17, cex=0.6)
+
+## Allow a second plot on the same graph
+par(new=TRUE)
+
+# plot pitch angle
+plot(time, dat$pitch.agl, type = "o", axes=FALSE, ylim=c(-10,10), col="purple", cex=0.5,ylab="",xlab="")
+points(time[lnd], dat$pitch.agl[lnd], col="red", pch=19, cex=0.5)
+points(time[lap], dat$pitch.agl[lap], col="grey50", pch=19, cex=0.5)
+points(time[lapt], dat$pitch.agl[lapt], col="orange", pch=19, cex=0.5)
+
+# plot acceleration
+#time8=c(1:((idlnd[i]-id80[i]+1+5)*8))/8
+#Accel=unlist(dat[,14:21])
+points(time, dat$maxacc, col="turquoise4", pch=19, cex=0.5, type="o")
+lines(time, dat$maxacc, col="turquoise4")
+points(time[lnd], dat$maxacc[lnd], col="red", pch=19, cex=0.5)
+# lines(time, AccelAve*5)
+
+# plot command
+CaptPitchComAve=rowMeans(dat[,46:52])
+FOPitchComAve=rowMeans(dat[,53:60])
+lines(time, CaptPitchComAve, col="red")
+lines(time, FOPitchComAve, col="green")
+mtext("Pitch Angle and Command",side=4,line=4) 
+axis(4, ylim=c(-10,10), las=1)
+axis(1,pretty(range(time),10))
+```
+
+
+#对20-0ft线性插值,取相同高度上的10个点聚类
+```{r}
+#线性插值,20-0每隔2ft取一个点,10个观测值近似原始V-H图
+#!!!这里hlast是减去了着陆点高度作差后的hlast,与上面的不一样！不能随便重新跑代码了！
+interp=function(h,v){
+  out=numeric()
+  for(i in 1:10){
+    x=seq(-20,-2,by=2)[i]
+    sh=h[max(which(h<=x))]
+    eh=h[max(which(h<=x))+1]
+    sv=v[max(which(h<=x))]
+    ev=v[max(which(h<=x))+1]
+    out[i]=(sv-ev)/(sh-eh)*(x-sh)+sv
+  }
+  return(out)
+}
+simv=data.frame(t(rep(NA,11)))
+for(i in 1:3034){
+  k=c(1:3329)[-idabnorm][i]
+  simv[i,]=c(interp(hlast[id20[k]:19,k],vylast[id20[k]:19,k]),vylast[19,k])
+}
+#对实际重着陆样本线性插值
+simvh=data.frame(t(rep(NA,11)))
+for(i in 1:6){  #注意h与着陆点作差统一0点
+  simvh[i,]=c(interp(hlasth[id20h[i]:19,i]-hlasth[19,i],vylasth[id20h[i]:19,i]),vylasth[19,i])
+}
+
+
+#用11个观测点的近似VH聚类
+library(kmed)
+library(cluster)
+library(fpc)
+simvnew=simv
+simv=scale(simv)
+#simv[,9:11]=1.5*simv[,9:11]  #最后0,2,4ft加权试一下
+km5=pam(simv,6,diss=FALSE)
+clust5=data.frame(clust=as.factor(km5$clustering))
+med5=km5$id.med #还原成原本的序号
+#map5=data.frame(clust=as.factor(1:8),class=as.factor(c(1,2,3,4,5,2,4,6)))
+#clust5=left_join(clust5,map5,by=c("clust"="clust"))
+clust5$class=clust5$clust
+#各类类均值/类中心决定如何合并,暂时没用
+simvmean=data.frame(rep(NA,8))
+for(i in 1:11){
+  simvmean[,i]=tapply(X=simv[,i],FUN=mean,INDEX=list(clust5$clust))
+}
+colnames(simvmean)=colnames(simv)
+dist(simvmean)
+dist(km5$medoid80)
+#预测真实重着陆样本属于哪类,看和类中心的距离
+#原始11个特征均值方差,用于标准化
+simvmean=apply(X=simvnew,MARGIN=2,FUN=mean)
+simvsd=apply(X=simvnew,MARGIN=2,FUN=sd)
+simvh.std=scale(simvh,center=simvmean,scale=simvsd)
+rownames(simvh.std)=paste("Case",1:6,sep="")
+dist(rbind(simvh.std,km5$medoids)) #得到结果case4离3,6类更近,其余均为6
+
+tapply(X=t(vylast[19,-idabnorm]),FUN=fvy,INDEX=list(clust5$clust))
+tapply(X=alnd[-idabnorm],FUN=fa,INDEX=list(clust5$clust))
+tapply(X=t(vylast[19,-idabnorm]),FUN=fvy,INDEX=list(clust5$class))
+tapply(X=alnd[-idabnorm],FUN=fa,INDEX=list(clust5$class))
+#类中心序列单独拎出来(手动归类的取均值)
+med=list()
+for(i in 1:6){
+  med[[i]]=data.frame(h=hlast[,-idabnorm][,med5[i]],v=vylast[,-idabnorm][,med5[i]])
+}
+
+
+#各类V-H图
+k=1
+id=sample(which(clust5$clust==k),10,replace=FALSE)
+plot(x=hlast[,-idabnorm][,id[1]],y=vylast[,-idabnorm][,id[1]],type="l",main=paste("20-0ftClust",k,sep=""),xlim=c(-20,0),ylim=c(-16,900),xlab="Height",ylab="VerticalSpd",col=k)
+for(i in 2:length(id)){
+  lines(x=hlast[,-idabnorm][,id[i]],y=vylast[,-idabnorm][,id[i]],type="l",col=k)
+}
+
+k=1
+id=which(clust5$clust==k)
+plot(x=hlast[,-idabnorm][,id[1]],y=vylast[,-idabnorm][,id[1]],type="l",main=paste("20-0ftClust",k,sep=""),xlim=c(-20,0),ylim=c(-16,900),xlab="Height",ylab="VerticalSpd",col="pink")
+for(i in 2:length(id)){
+  lines(x=hlast[,-idabnorm][,id[i]],y=vylast[,-idabnorm][,id[i]],type="l",col="pink")
+}
+lines(x=hlast[,-idabnorm][,med5[k]],y=vylast[,-idabnorm][,med5[k]],type="l",col="blue")
+text(x=-3.5,y=800,labels=summary(clust5$clust)[k],cex=1.6,col="#8B7B8B")
+text(x=-3,y=650,labels=paste(round(summary(clust5$clust)[k]/3034*100,2),"%",sep=""),cex=1.6,col="#8B7B8B")
+#各类V-t图
+k=6
+id=which(clust5$clust==k)
+plot(x=(id20[-idabnorm][id[1]]:19)-19,y=vylast[,-idabnorm][id20[-idabnorm][id[1]]:19,id[1]],type="l",main=paste("20-0ftClust",k,sep=""),xlim=c(-12,0),ylim=c(-16,900),xlab="TimeToLanding",ylab="VerticalSpd",col="#FFD700")
+for(i in 2:length(id)){
+  lines(x=(id20[-idabnorm][id[i]]:19)-19,y=vylast[,-idabnorm][id20[-idabnorm][id[i]]:19,id[i]],type="l",col="#FFD700")
+}
+lines(x=(id20[-idabnorm][med5[k]]:19)-19,y=vylast[,-idabnorm][id20[-idabnorm][med5[k]]:19,med5[k]],type="l",col="blue")
+#V-H,V-t,H-t对照图
+k=1
+id=sample(which(clust5$class==k),3,replace=FALSE)
+plot(x=hlast[,-idout][,id[1]],y=vylast[,-idout][,id[1]],type="l",main=paste("80-0ftClust",k,sep=""),xlim=c(-80,0),ylim=c(-16,900),xlab="Height",ylab="VerticalSpd",col=1)
+points(x=hlast[,-idout][,id[1]],y=vylast[,-idout][,id[1]],col=1,cex=0.5)
+for(i in 2:length(id)){
+  lines(x=hlast[,-idout][,id[i]],y=vylast[,-idout][,id[i]],type="l",col=i)
+  points(x=hlast[,-idout][,id[i]],y=vylast[,-idout][,id[i]],col=i,cex=0.5)
+}
+k=1
+id=sample(which(clust5$class==k),3,replace=FALSE)
+plot(x=(id80[valid][-idout][id[1]]:19)-19,y=vylast[,-idout][id80[valid][-idout][id[1]]:19,id[1]],type="l",main=paste("80-0ftClust",k,sep=""),xlim=c(-16,0),ylim=c(-16,900),xlab="TimeToLanding",ylab="VerticalSpd",col=1)
+points(x=(id80[valid][-idout][id[1]]:19)-19,y=vylast[,-idout][id80[valid][-idout][id[1]]:19,id[1]],col=1,cex=0.5)
+for(i in 2:length(id)){
+  lines(x=(id80[valid][-idout][id[i]]:19)-19,y=vylast[,-idout][id80[valid][-idout][id[i]]:19,id[i]],type="l",col=i)
+  points(x=(id80[valid][-idout][id[i]]:19)-19,y=vylast[,-idout][id80[valid][-idout][id[i]]:19,id[i]],col=i,cex=0.5)
+}
+#H-t
+plot(x=(id80[valid][-idout][id[1]]:19)-19,y=-hlast[,-idout][id80[valid][-idout][id[1]]:19,id[1]],type="l",main=paste("80-0ftClust",k,sep=""),xlim=c(-16,0),ylim=c(-16,80),xlab="TimeToLanding",ylab="Height",col=1)
+points(x=(id80[valid][-idout][id[1]]:19)-19,y=-hlast[,-idout][id80[valid][-idout][id[1]]:19,id[1]],col=1,cex=0.5)
+for(i in 2:length(id)){
+  lines(x=(id80[valid][-idout][id[i]]:19)-19,y=-hlast[,-idout][id80[valid][-idout][id[i]]:19,id[i]],type="l",col=i)
+  points(x=(id80[valid][-idout][id[i]]:19)-19,y=-hlast[,-idout][id80[valid][-idout][id[i]]:19,id[i]],col=i,cex=0.5)
+}
+##统计各类超限情况
+##统计3*3各类速度/加速度超限概率
+qvy=quantile(t(vylast[19,-idabnorm]),probs=0.95)  #速度
+fvy=function(x){
+  return(length(x[x>qvy])/length(x))
+}
+qa=quantile(alnd[-idabnorm],probs=0.95)  #加速度
+fa=function(x){
+  return(length(x[x>qa])/length(x))
+}
+tapply(X=t(vylast[19,-idabnorm]),FUN=fvy,INDEX=list(clust5$clust))
+tapply(X=alnd[-idabnorm],FUN=fa,INDEX=list(clust5$clust))
+tapply(X=t(vylast[19,-idabnorm]),FUN=fvy,INDEX=list(clust5$class))
+tapply(X=alnd[-idabnorm],FUN=fa,INDEX=list(clust5$class))
+tapply(X=t(vylast[19,-idabnorm]),FUN=fvy,INDEX=list(clust5$class))
+tapply(X=alnd[-idabnorm],FUN=fa,INDEX=list(clust5$class))
+#各类类均值/类中心决定如何合并
+simvmean=data.frame(rep(NA,8))
+for(i in 1:11){
+  simvmean[,i]=tapply(X=scale(simvnew[,i]),FUN=mean,INDEX=list(clust5$clust))
+}
+colnames(simvmean)=colnames(coefsnew)
+dist(simvmean)
+
+dist(km5$medoid80)
+#各类着陆情况密度分布图
+library(ggplot2)
+library(ggridges)
+textvy=paste(round(tapply(X=t(vylast[19,-idabnorm]),FUN=fvy,INDEX=list(clust5$class))*100,2),"%",sep="")
+
+ggplot(data.frame(vylast[19,-idabnorm]),aes(x=vylast[19,-idabnorm],y=clust5$class,fill=clust5$class,col=clust5$class))+geom_density_ridges(alpha=0.4)+theme_ridges()+theme(plot.title=element_text(hjust=0.5))+labs(x="Vylnd(ft/min)",title="Density Plot of Vylnd")+scale_fill_manual(values = c("#DAA520","#66CD00","#009ACD","#6959CD","#D02090","#EE2C2C"))+scale_color_manual(values = c("#DAA520","#66CD00","#009ACD","#6959CD","#D02090","#EE2C2C"))+geom_vline(xintercept=quantile(vylast[19,-idabnorm],0.95),col="#8B7B8B",linetype=5)+annotate("text", label="95%",x=300,y=7.1, size=4.5,col="#8B7B8B")+annotate("text",label=textvy[1],x=350,y=1.3,size=4.5,col="#8B7B8B")+annotate("text",label=textvy[2],x=350,y=2.3,size=4.5,col="#8B7B8B")+annotate("text",label=textvy[3],x=350,y=3.3,size=4.5,col="#8B7B8B")+annotate("text",label=textvy[4],x=350,y=4.3,size=4.5,col="#8B7B8B")+annotate("text",label=textvy[5],x=350,y=5.3,size=4.5,col="#8B7B8B")+annotate("text",label=textvy[6],x=350,y=6.3,size=4.5,col="#8B7B8B")
+
+texta=paste(round(tapply(X=alnd[-idabnorm],FUN=fa,INDEX=list(clust5$class))*100,2),"%",sep="")
+ggplot(data.frame(alnd[-idabnorm]),aes(x=alnd[-idabnorm],y=clust5$class,fill=clust5$class,col=clust5$class))+geom_density_ridges(alpha=0.4)+theme_ridges()+theme(plot.title=element_text(hjust=0.5))+labs(x="Alnd(g)",title="Density Plot of Alnd")+xlim(0.7,2)+scale_fill_manual(values = c("#DAA520","#66CD00","#009ACD","#6959CD","#D02090","#EE2C2C"))+scale_color_manual(values = c("#DAA520","#66CD00","#009ACD","#6959CD","#D02090","#EE2C2C"))+geom_vline(xintercept=quantile(alnd[-idabnorm],0.95),col="#8B7B8B",linetype=5)+annotate("text", label="95%",x=1.5,y=6.9, size=4.5,col="#8B7B8B")+annotate("text",label=texta[1],x=1.7,y=1.3,size=4.5,col="#8B7B8B")+annotate("text",label=texta[2],x=1.7,y=2.3,size=4.5,col="#8B7B8B")+annotate("text",label=texta[3],x=1.7,y=3.3,size=4.5,col="#8B7B8B")+annotate("text",label=texta[4],x=1.7,y=4.3,size=4.5,col="#8B7B8B")+annotate("text",label=texta[5],x=1.7,y=5.3,size=4.5,col="#8B7B8B")+annotate("text",label=texta[6],x=1.7,y=6.3,size=4.5,col="#8B7B8B")
+
+
+#各类V-H类中心及分位数叠加图(先用线性插值出来的simv)
+quant=data.frame(rep(NA,11*6))
+quant[,1]=rep(1:6,11)
+for(i in 2:6){
+  x=numeric()
+  prob=c(0.75,0.5,0.25,0.95,0.05)[i-1]
+  for(j in 1:11){
+    x=c(x,tapply(X=simvnew[,j],FUN=quantile,INDEX=list(clust5$class),prob=prob))
+  }
+  quant[,i]=x
+}
+colnames(quant)=c("clust","quant75","med","quant25","quant95","quant5")
+quant$clust=as.factor(quant$clust)
+
+ggplot(quant,aes(x=rep(seq(-20,0,by=2),each=6),col=clust,fill=clust,group=clust))+geom_ribbon(aes(ymin=quant$quant25,ymax=quant$quant75,group=clust,alpha=I(0.4)))+geom_ribbon(aes(ymin=quant$quant5,ymax=quant$quant95,group=clust,alpha=I(0.2)))+geom_line(aes(x=rep(seq(-20,0,by=2),each=6),y=med))+labs(y="Vertical Speed",x="Height",title="CI for V-H")+theme(plot.title=element_text(hjust=0.5))+scale_fill_manual(values = c("#DAA520","#66CD00","#009ACD","#6959CD","#D02090","#EE2C2C"))+scale_color_manual(values = c("#DAA520","#66CD00","#009ACD","#6959CD","#D02090","#EE2C2C"))
+#ggplot(quant,aes(x=rep(seq(-20,0,by=2),each=6),col=clust,fill=clust,group=clust))+geom_ribbon(aes(ymin=quant$quant25,ymax=quant$quant75,group=clust,alpha=0.65))+geom_ribbon(aes(ymin=quant$quant5,ymax=quant$quant95,group=clust,alpha=0.6))+geom_line(aes(x=rep(seq(-20,0,by=2),each=6),y=med))+geom_line(aes(x=rep(seq(-20,0,by=2),each=6),y=norm,group=clust),col=I("blue"),cex=1)+geom_line(aes(x=rep(1:40,4),y=abnorm,group=clust),col=I("red"),cex=1)+labs(y="Vertical Speed",x="Time",title="CI for Vertical Speed")+theme(plot.title=element_text(hjust=0.5))
+
+#各类V-t类中心及分位数叠加图(真实的v,类中心是中位数,外加代表航班)
+quantvt=data.frame(rep(NA,13*6))
+quantvt[,1]=rep(1:6,13)
+for(i in 2:6){
+  x=numeric()
+  prob=c(0.75,0.5,0.25,0.95,0.05)[i-1]
+  for(j in 7:19){
+    x=c(x,tapply(X=vylast[j,][-idout],FUN=quantile,INDEX=list(clust5$class),prob=prob))
+  }
+  quantvt[,i]=x
+}
+colnames(quantvt)=c("clust","quant75","med","quant25","quant95","quant5")
+quantvt$clust=as.factor(quantvt$clust)
+
+ggplot(quantvt,aes(x=rep((-12):0,each=6),col=clust,fill=clust,group=clust))+geom_ribbon(aes(ymin=quantvt$quant25,ymax=quantvt$quant75,group=clust,alpha=I(0.4)))+geom_ribbon(aes(ymin=quantvt$quant5,ymax=quantvt$quant95,group=clust,alpha=I(0.2)))+geom_line(aes(x=rep((-12):0,each=6),y=med))+labs(y="Vertical Speed",x="TimeToLanding",title="CI for V-t")+theme(plot.title=element_text(hjust=0.5))+scale_fill_manual(values = c("#DAA520","#66CD00","#009ACD","#6959CD","#EE2C2C","#D02090"))+scale_color_manual(values = c("#DAA520","#66CD00","#009ACD","#6959CD","#EE2C2C","#D02090"))
+```
+
+
+###完整分析体系
+##1.着陆情况描述性分析
+```{r}
+#着陆下沉率/垂直过载密度分布图
+library(ggplot2)
+vylnd=c(t(vylast[19,-idabnorm]),t(vylasth[19,]))
+ggplot(data.frame(vylnd),aes(x=c(vylnd)))+geom_density(aes(fill=I("#6baed6"),col=I("#6baed6"),alpha=I(0.6)))+geom_vline(xintercept=quantile(vylast[19,-idabnorm],c(0.75,0.95,0.99,0.999)),col="#8B7B8B",linetype=5)+theme(plot.title=element_text(hjust=0.5))+labs(x="Landing VerticalSpd (ft/min)",title="Density Plot of Landing VerticalSpd")+annotate("text",label="75%",x=140,y=0.0055,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(vylnd,0.75),2),x=140,y=0.005,size=4.5,col="#8B7B8B") +annotate("text",label="95%",x=225,y=0.0055,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(vylnd,0.95),2),x=225,y=0.005,size=4.5,col="#8B7B8B") +annotate("text",label="99%",x=320,y=0.0055,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(vylnd,0.99),2),x=320,y=0.005,size=4.5,col="#8B7B8B")+annotate("text",label="99.9%",x=400,y=0.0055,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(vylast[19,-idabnorm],0.999),2),x=400,y=0.005,size=4.5,col="#8B7B8B")
+
+ggplot(data.frame(c(alnd[-idabnorm],alndh)),aes(x=c(alnd[-idabnorm],alndh)))+geom_density(aes(fill=I("#6baed6"),col=I("#6baed6"),alpha=I(0.6)))+geom_vline(xintercept=quantile(alnd,c(0.75,0.95,0.99,0.999)),col="#8B7B8B",linetype=5)+theme(plot.title=element_text(hjust=0.5))+labs(x="Landing NormalAcc (g)",title="Density Plot of Landing NormalAcc")+annotate("text",label="75%",x=1.16,y=4.5,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(alnd,0.75),2),x=1.16,y=4,size=4.5,col="#8B7B8B") +annotate("text",label="95%",x=1.31,y=4.5,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(alnd,0.95),2),x=1.31,y=4,size=4.5,col="#8B7B8B") +annotate("text",label="99%",x=1.53,y=4.5,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(alnd,0.99),2),x=1.53,y=4,size=4.5,col="#8B7B8B")+annotate("text",label="99.9%",x=1.68,y=4.5,size=4.5,col="#8B7B8B")+annotate("text",label=round(quantile(alnd,0.999),2),x=1.68,y=4,size=4.5,col="#8B7B8B")
+```
+
+##2.整体分段均值方差特征聚类
+```{r}
+##拉平点idlap1/hlap1判断规则：
+#俯仰角:第1-2s增大,第1-3s总体增大 & 下沉率:连续3s隔点降速,且3s降速>阈值60
+#9+6个特征：整体空速均值方差,下滑垂直速度均值方差极差,拉平高度
+#200-50: 下沉率均值标准差、下沉率/地速比均值、空中过载最大值、空中俯仰角最大值、空中滚转角（绝对值）最大值、拉平高度、拉平点俯仰角、拉平点滚转角（绝对值）
+#50-0: 下沉率均值标准差、下沉率/地速比均值、空中过载最大值、空中俯仰角最大值、空中滚转角（绝对值）最大值。
+attr=data.frame(t(rep(NA,15)))
+colnames(attr)=c("vymean1","vysd1","vratio1","maxacc1","maxpitch1","maxroll1","hlap","pitchlap","rolllap","vymean2","vysd2","vratio2","maxacc2","maxpitch2","maxroll2")
+for(i in 31:38){
+  attrnew[,i]=rep(NA,3040)
+}
+#id200=numeric()
+for(i in 1:3034){
+  k=valid[c(1:3299)[-idabnorm][i]]
+  dat=a320[[k]][id120[k]:idlnd[k],]
+  dat1=a320[[k]][id200[k]:(idlnd[k]-18+id50[k]-1),]
+  dat2=a320[[k]][(idlnd[k]-18+id50[k]-1):idlnd[k],]
+  n=nrow(dat2)
+  #dat=a320[[i]]
+  #id200[k]=max(which(dat$height>200))+1
+  #注意idlap1才是最后定的真实拉平判断,起始点为120ft,所以idlap1对应dat的角标
+  #attr[i,1:9]=c(-mean(dat1$Inertial.Vertical.spd.CA),sd(dat1$Inertial.Vertical.spd.CA),mean(dat1$Inertial.Vertical.spd.CA/dat1$GPS.GROUND.SPEED.CAPT),max(dat1$maxacc),max(dat1$pitch.agl),max(abs(dat1$roll.agl)),dat$height[idlap1[i]],dat$pitch.agl[idlap1[i]],abs(dat$roll.agl[idlap1[i]]))
+  #attr[i,10:15]=c(-mean(dat2$Inertial.Vertical.spd.CA),sd(dat2$Inertial.Vertical.spd.CA),mean(dat2$Inertial.Vertical.spd.CA/dat2$GPS.GROUND.SPEED.CAPT),max(dat2$maxacc[-n]),max(dat2$pitch.agl[-n]),max(abs(dat2$roll.agl[-n])))
+  # cp=rowMeans(dat[,22:29])+rowMeans(dat[,30:37])
+  # cr=rowMeans(dat[,48:55])+rowMeans(dat[,56:63])
+  # 
+  # cp1=rowMeans(dat1[,22:29])+rowMeans(dat1[,30:37])
+  # cr1=rowMeans(dat1[,48:55])+rowMeans(dat1[,56:63])
+  # cp2=rowMeans(dat2[,22:29])+rowMeans(dat2[,30:37])
+  # cr2=rowMeans(dat2[,48:55])+rowMeans(dat2[,56:63]) #取控制杆位极差,95%绝对值分位数统计量
+  
+  shun1=dat1$v_para
+  shun1[which(dat1$v_para<0)]=0
+  ni1=dat1$v_para
+  ni1[which(dat1$v_para>0)]=0
+  shear1=dat1$v_para[-1]-dat1$v_para[-length(dat1$v_para)]#逆风变顺风不好,所以直接取max不用abs
+  shun2=dat2$v_para
+  shun2[which(dat2$v_para<0)]=0
+  ni2=dat2$v_para
+  ni2[which(dat2$v_para>0)]=0
+  shear2=dat2$v_para[-1]-dat2$v_para[-length(dat2$v_para)]
+  
+  #attrnew[i,16:29]=c(diff(range(cp1)),quantile(abs(cp1),0.99),diff(range(cr1)),quantile(abs(cr1),0.99),diff(range(cp2)),quantile(abs(cp2[-n]),0.99),diff(range(cr2)),quantile(abs(cr2[-n]),0.99),cp[idlap1[i]],abs(cr[idlap1[i]]),dat2$pitch.agl[n],abs(dat2$roll.agl[n]),cp2[n],abs(cr2[n]))
+  attrnew[i,31:38]=c(quantile(shun1,0.99),quantile(-ni1,0.99),quantile(dat1$v_vert,0.99),quantile(shear1,0.99),quantile(shun2,0.99),quantile(-ni2,0.99),quantile(dat2$v_vert,0.99),quantile(shear2,0.99))
+}
+colnames(attrnew)[16:30]=c(paste(rep(c("range","max"),4),rep(rep(c("cp","cr"),each=2),2),rep(c(1,2),each=4),sep=""),"lapcp","lapcr","pitchlnd","rolllnd","cplnd","crlnd","clust")
+colnames(attrnew)[31:38]=c(paste(rep(c("vshun","vni","vvert","vshear"),2),rep(1:2,each=4),sep=""))
+
+
+#提取实际重着陆的6个航班特征,加到attrnew里
+id200h=numeric()
+for(i in 1:6){
+  #heavynew[[i]]$roll.agl=rowMeans(heavynew[[i]][,61:62])
+  # heavynew[[i]]$cp=rowMeans(heavynew[[i]][,45:52])+rowMeans(heavynew[[i]][,53:60])
+  # heavynew[[i]]$cr=rowMeans(heavynew[[i]][,63:70])+rowMeans(heavynew[[i]][,71:78])
+  heavynew[[i]]$v_para=heavynew[[i]]$WIN_SPD*cos((heavynew[[i]]$WIN_DIR-heavynew[[i]]$HEAD_MAG)/180*pi)
+  heavynew[[i]]$v_vert=heavynew[[i]]$WIN_SPD*sin((heavynew[[i]]$WIN_DIR-heavynew[[i]]$HEAD_MAG)/180*pi)
+
+  #dat=heavynew[[i]]
+  #id200h[i]=max(which(dat$height>200))+1
+  dat=heavynew[[i]][id120h[i]:idlndh[i],]
+  dat1=heavynew[[i]][id200h[i]:(idlndh[i]-18+id50h[i]-1),]
+  dat2=heavynew[[i]][(idlndh[i]-18+id50h[i]-1):idlndh[i],]
+  n=nrow(dat2)
+  
+  shun1=dat1$v_para
+  shun1[which(dat1$v_para<0)]=0
+  ni1=dat1$v_para
+  ni1[which(dat1$v_para>0)]=0
+  shear1=dat1$v_para[-1]-dat1$v_para[-length(dat1$v_para)]#逆风变顺风不好,所以直接取max不用abs
+  shun2=dat2$v_para
+  shun2[which(dat2$v_para<0)]=0
+  ni2=dat2$v_para
+  ni2[which(dat2$v_para>0)]=0
+  shear2=dat2$v_para[-1]-dat2$v_para[-length(dat2$v_para)]
+  
+  #注意idlap1才是最后定的真实拉平判断,起始点为120ft,所以idlap1对应dat的角标
+  #attrnew[i+3034,1:9]=c(-mean(dat1$IVV_CA),sd(dat1$IVV_CA),mean(dat1$IVV_CA/dat1$GS),max(dat1$maxacc),max(dat1$pitch.agl),max(abs(dat1$roll.agl)),dat$height[idlap1[i+3034]],dat$pitch.agl[idlap1[i+3034]],abs(dat$roll.agl[idlap1[i+3034]]))
+  #attrnew[i+3034,10:15]=c(-mean(dat2$IVV_CA),sd(dat2$IVV_CA),mean(dat2$IVV_CA/dat2$GS),max(dat2$maxacc[-n]),max(dat2$pitch.agl[-n]),max(abs(dat2$roll.agl[-n])))
+
+  #attrnew[i+3034,16:30]=c(diff(range(dat1$cp)),quantile(abs(dat1$cp),0.99),diff(range(dat1$cr)),quantile(abs(dat1$cr),0.99),diff(range(dat2$cp)),quantile(abs(dat2$cp[-n]),0.99),diff(range(dat2$cr)),quantile(abs(dat2$cr[-n]),0.99),dat$cp[idlap1[i+3034]],abs(dat$cr[idlap1[i+3034]]),dat2$pitch.agl[n],abs(dat2$roll.agl[n]),dat2$cp[n],abs(dat2$cr[n]),NA)
+  attrnew[i+3034,31:38]=c(quantile(shun1,0.99),quantile(-ni1,0.99),quantile(dat1$v_vert,0.99),quantile(shear1,0.99),quantile(shun2,0.99),quantile(-ni2,0.99),quantile(dat2$v_vert,0.99),quantile(shear2,0.99))
+}
+
+
+#15个特征聚类
+library(cluster)
+library(factoextra)
+#attrnew=attr
+attr=data.frame(scale(attrnew[,1:15]))
+attr[,c(2,4,7,8,11,13,14,15)]=1.5*attr[,c(2,4,7,8,11,13,14,15)]
+#attr$vlim=rep(0,3034)
+attr$vlim[which(vylast[19,-idabnorm]>qvy)]=1
+attr$vlim=as.factor(attr$vlim)
+attr$alim=rep(0,3034)
+attr$alim[which(alnd[-idabnorm]>qa)]=1
+attr$alim=as.factor(attr$alim)
+#逻辑回归找影响着陆超限的显著因素,前面聚类时加权
+attr=rbind(attr,attr[which(vylast[19,-idabnorm]>qvy),],attr[which(vylast[19,-idabnorm]>qvy),],attr[which(vylast[19,-idabnorm]>qvy),],attr[which(vylast[19,-idabnorm]>qvy),],attr[which(vylast[19,-idabnorm]>qvy),],attr[which(alnd[-idabnorm]>qa),],attr[which(alnd[-idabnorm]>qa),],attr[which(alnd[-idabnorm]>qa),],attr[which(alnd[-idabnorm]>qa),],attr[which(alnd[-idabnorm]>qa),])
+logitv=glm(vlim~vymean1+vysd1+vratio1+maxacc1+maxpitch1+maxroll1+hlap+pitchlap+rolllap+vymean2+vysd2+vratio2+maxacc2+maxpitch2+maxroll2,family=binomial(link='logit'),data=attr)
+summary(logitv)
+logita=glm(alim~vymean1+vysd1+vratio1+maxacc1+maxpitch1+maxroll1+hlap+pitchlap+rolllap+vymean2+vysd2+vratio2+maxacc2+maxpitch2+maxroll2,family=binomial(link='logit'),data=attr)
+summary(logita)
+
+fviz_nbclust(attr,kmeans,method="wss") #用类内ss确定类的数目
+kmwhole=kmeans(attr,centers=5,nstart=50,iter.max=20)
+attrnew$clust=as.factor(kmwhole$cluster)
+#medwhole=kmwhole$id.med
+#各类特征均值
+attrmean=data.frame(rep(NA,5))
+for(i in 1:15){
+  attrmean[,i]=tapply(attrnew[,i],FUN=mean,INDEX=attrnew$clust)
+}
+colnames(attrmean)=colnames(attr)
+#各特征本身均值标准差
+mean1=apply(attrnew[,-16],FUN=mean,MARGIN=2)
+sd1=apply(attrnew[,-16],FUN=sd,MARGIN=2)
+#各类各特征均值还原
+#c(1,1.5,1,1.5,1,1,1.5,1.5,1,1,1.5,1,rep(1.5,3))
+medwhole=kmwhole$centers/rep(c(1,1.5,1,1.5,1,1,1.5,1.5,1,1,1.5,1,rep(1.5,3)),each=5)*rep(sd1,each=5)+rep(mean1,each=5)
+
+
+#各类V-dist图
+for(k in 1:5){
+id=which(attrnew$clust==k)
+i=sample(id,1)
+j=valid[c(1:3299)[-idabnorm][i]]
+dat=a320[[j]][id200[j]:idlnd[j],]
+plot(x=-dat$dist,y=-dat$Inertial.Vertical.spd.CA,type="l",main=paste("200-0ft Clust",k,sep=""),xlim=c(-1,0),ylim=c(-16,1100),xlab="DisttoTouchdown",ylab="VerticalSpd",col="blue")
+for(i in id){
+  j=valid[c(1:3299)[-idabnorm][i]]
+  dat=a320[[j]][id200[j]:idlnd[j],]
+  lines(x=-dat$dist,y=-dat$Inertial.Vertical.spd.CA,col="pink")
+}
+i=sample(id,1)
+j=valid[c(1:3299)[-idabnorm][i]]
+dat=a320[[j]][id200[j]:idlnd[j],]
+lines(x=-dat$dist,y=-dat$Inertial.Vertical.spd.CA,col="blue",lwd=2)
+i=sample(id,1)
+j=valid[c(1:3299)[-idabnorm][i]]
+dat=a320[[j]][id200[j]:idlnd[j],]
+lines(x=-dat$dist,y=-dat$Inertial.Vertical.spd.CA,col="blue",lwd=2)
+}
+
+##统计各类超限情况
+##统计3*3各类速度/加速度超限概率
+qvy=quantile(t(vylast[19,-idabnorm]),probs=0.99)  #速度
+fvy=function(x){
+  return(length(x[x>qvy])/length(x))
+}
+qa=quantile(alnd[-idabnorm],probs=0.99)  #加速度
+fa=function(x){
+  return(length(x[x>qa])/length(x))
+}
+tapply(X=t(vylast[19,-idabnorm]),FUN=fvy,INDEX=list(attrnew$clust))
+tapply(X=alnd[-idabnorm],FUN=fa,INDEX=list(attrnew$clust))
+
+
+#各类着陆情况密度分布图
+library(ggplot2)
+library(ggridges)
+textvy=paste(round(tapply(X=t(vylast[19,-idabnorm]),FUN=fvy,INDEX=list(attrnew$clust))*100,2),"%",sep="")
+ggplot(data.frame(vylast[19,-idabnorm]),aes(x=vylast[19,-idabnorm],y=attrnew$clust,fill=attrnew$clust,col=attrnew$clust))+geom_density_ridges(alpha=0.4)+theme_ridges()+theme(plot.title=element_text(hjust=0.5))+labs(x="Vylnd(ft/min)",title="Density Plot of Vylnd")+scale_fill_manual(values = c("#D02090","#66CD00","#009ACD","#EE2C2C","#DAA520"))+scale_color_manual(values = c("#D02090","#66CD00","#009ACD","#EE2C2C","#DAA520"))+geom_vline(xintercept=qvy,col="#8B7B8B",linetype=5)+annotate("text", label="99%",x=300,y=6.3, size=4.5,col="#8B7B8B")+annotate("text",label=textvy[1],x=350,y=1.3,size=4.5,col="#8B7B8B")+annotate("text",label=textvy[2],x=350,y=2.3,size=4.5,col="#8B7B8B")+annotate("text",label=textvy[3],x=350,y=3.3,size=4.5,col="#8B7B8B")+annotate("text",label=textvy[4],x=350,y=4.3,size=4.5,col="#8B7B8B")+annotate("text",label=textvy[5],x=350,y=5.3,size=4.5,col="#8B7B8B")
+#"#DAA520","#66CD00","#009ACD","#6959CD","#D02090","#EE2C2C"
+
+texta=paste(round(tapply(X=t(alnd[-idabnorm]),FUN=fa,INDEX=list(attrnew$clust))*100,2),"%",sep="")
+ggplot(data.frame(alnd[-idabnorm]),aes(x=alnd[-idabnorm],y=attrnew$clust,fill=attrnew$clust,col=attrnew$clust))+geom_density_ridges(alpha=0.4)+theme_ridges()+theme(plot.title=element_text(hjust=0.5))+labs(x="Alnd(g)",title="Density Plot of Alnd")+scale_fill_manual(values = c("#D02090","#66CD00","#009ACD","#EE2C2C","#DAA520"))+scale_color_manual(values = c("#D02090","#66CD00","#009ACD","#EE2C2C","#DAA520"))+geom_vline(xintercept=qa,col="#8B7B8B",linetype=5)+annotate("text", label="99%",x=1.43,y=6.3, size=4.5,col="#8B7B8B")+annotate("text",label=texta[1],x=1.55,y=1.3,size=4.5,col="#8B7B8B")+annotate("text",label=texta[2],x=1.55,y=2.3,size=4.5,col="#8B7B8B")+annotate("text",label=texta[3],x=1.55,y=3.3,size=4.5,col="#8B7B8B")+annotate("text",label=texta[4],x=1.55,y=4.3,size=4.5,col="#8B7B8B")+annotate("text",label=texta[5],x=1.55,y=5.3,size=4.5,col="#8B7B8B")
+
+#6个参数分布,各类代表航班位置
+for(i in 1:15){
+  plot(density(attrnew[,i]),xlab=colnames(attrnew)[i],main=colnames(attrnew)[i])
+  abline(v=medwhole[,i],col=c(2:6))
+}
+plot(density(attrnew$airmean),xlab="AirSpd Mean",main="AirSpd Mean")
+abline(v=attrnew$airmean[medwhole],col=c(2,3,4,6))
+plot(density(attrnew$airsd),xlab="AirSpd SD",main="AirSpd StandardDeviation")
+abline(v=attrnew$airsd[medwhole],col=c(2,3,4,6))
+plot(density(attrnew$vymean),xlab="VerticalSpd Mean",main="VerticalSpd Mean")
+abline(v=attrnew$vymean[medwhole],col=c(2,3,4,6))
+plot(density(attrnew$vysd),xlab="VerticalSpd SD",main="VerticalSpd StandardDeviation")
+abline(v=attrnew$vysd[medwhole],col=c(2,3,4,6))
+plot(density(attrnew$vyrange),xlab="VerticalSpd Range",main="VerticalSpd Range")
+abline(v=attrnew$vyrange[medwhole],col=c(2,3,4,6))
+plot(density(attrnew$hlap),xlab="Flare Height",main="Flare Height")
+abline(v=attrnew$hlap[medwhole],col=c(2,3,4,6))
+
+boxplot(airmean~clust,data=attrnew,xlab="Clust",ylab="AirSpd Mean",main="AirSpd Mean")
+boxplot(airsd~clust,data=attrnew,xlab="Clust",ylab="AirSpd SD",main="AirSpd StandardDeviation")
+boxplot(vymean1~clust,data=attrnew,xlab="Clust",ylab="VerticalSpd Mean1",main="VerticalSpd Mean")
+boxplot(vysd1~clust,data=attrnew,xlab="Clust",ylab="VerticalSpd SD1",main="VerticalSpd StandardDeviation")
+boxplot(vyrange~clust,data=attrnew,xlab="Clust",ylab="VerticalSpd Range",main="VerticalSpd Range")
+boxplot(hlap~clust,data=attrnew,xlab="Clust",ylab="Flare Height",main="Flare Height")
+```
+
+
+
+##3.异常时段分析,复现TRC（时点转换后的数据）
+```{r}
+#更新各航班距着陆点水平距离,距着陆时间
+for(i in 1:5128){
+  a320[[i]]$Capt.Pitch.Command.Position=rowMeans(a320[[i]][,22:29])
+  a320[[i]]$F.O.Pitch.Command.Position=rowMeans(a320[[i]][,30:37])
+  #a320[[i]]$dist=a320[[i]]$dist-a320[[i]]$dist[idlnd[i]]
+  a320[[i]]$t=1:nrow(a320[[i]])-idlnd[i]
+}
+
+#离散化水平距离区间
+trans=data.frame(dist=seq(0.7,0,by=-0.02),dt=1:36)
+#转换函数
+ind=function(x){
+  y=max(which(x<=trans$dist))
+  if(y == -Inf){
+    index=0
+  }else{
+    index=trans$dt[y]
+  }
+  index
+}
+#把水平距离转换为观测时点标签
+for(i in 1:5128){
+  a320[[i]]$dt=NA
+  for(j in 1:nrow(a320[[i]])){
+    a320[[i]][j,"dt"]=ind(a320[[i]]$dist[j])
+  }
+}
+
+#disttime=numeric()
+colind=c(1,41,64:66,70:71,79:81)
+data=data.frame(t(rep(NA,10)))
+colnames(data)=colnames(a320[[1]])[colind]
+for(i in 1:3034){
+  k=valid[c(1:3299)[-idabnorm]][i]
+  data=rbind(data,a320[[k]][id200[k]:idlnd[k],colind])
+  #dt=numeric()
+  #for(j in id120[k]:idlnd[k]){
+    #dt=c(dt,ind(a320[[k]]$dist[j]))
+  #}
+  #disttime=c(disttime,dt)
+}
+data=data[-1,]
+#data$dt=disttime
+data$vratio=data$Inertial.Vertical.spd.CA/data$GPS.GROUND.SPEED.CAPT
+#把所有特征归一化
+feat=data.frame(cbind(scale(data[,-c(3,6,7,10)]),scale(abs(data[,6])),data[,c(3,7,10)])) 
+colnames(feat)[8]="roll.agl"
+#EM聚类
+library(mclust)
+#prebic=mclustBIC(feat[,c(1,4,3,5)],G=9:20)#选择聚成几类
+#plot(prebic)
+#summary(prebic)
+em=Mclust(feat[,c(1,7,4,3,8)],G=9)
+summary(em,parameters=TRUE)
+plot(em,what="classification")
+
+feat$clust=factor(em$classification)
+
+#cluster result
+result=data.frame(count=unlist(data.frame(tapply(feat[,1],INDEX=list(feat$t,feat$clust),length))),cluster=rep(1:9,each=32),time=rep(c(-31:0),9))
+#result$count[which(is.na(result$count))]=0
+#各类样本数量随高度变化图
+ggplot(result,aes(x=time,y=factor(cluster),col=count,size=count))+geom_point()+scale_colour_gradient(low='lightblue',high='blue')+scale_size("count",limits=c(0,max(result$count)))+labs(x="Time to Touchdown",y="Cluster",title="Cluster w.r.t Time to Touchdown")+theme(plot.title=element_text(hjust=0.5))
+
+
+#计算正常分数
+#各个时刻9个component权重估计
+ppost=data.frame(em$z)
+pp=data.frame(rep(NA,32))
+for(i in 1:9){
+  pp[,i]=tapply(ppost[,i],FUN=sum,INDEX=feat$t)/tapply(feat$t,FUN=length,INDEX=feat$t)
+}
+#构建-31:0秒的32个混合高斯分布的
+N=10^6
+density=data.frame(rep(NA,10^6))
+for(t in 26:32){
+  n=as.numeric(round(N*pp[t,]))
+  sampdens=numeric()
+  for(i in 1:9){
+    if(n[i]!=0){
+      dens=data.frame(rep(NA,n[i]))
+      samples=data.frame(rep(NA,n[i]))
+      samples=rmvnorm(n=n[i],mean=em$parameters$mean[,i],sigma=em$parameters$variance$sigma[,,i])
+      for(j in 1:9){
+        dens[,j]=dmvnorm(x=samples,mean=em$parameters$mean[,j],sigma=em$parameters$variance$sigma[,,j])
+      }
+      sampdens=c(sampdens,rowSums(dens*t(pp[t,])))
+    }
+  }
+  if(length(sampdens)==10^6-1){
+    density[,t]=c(sampdens,NA)
+  }else if(length(sampdens)==10^6+1){
+    density[,t]=sampdens[-1]
+  }else{
+    density[,t]=sampdens
+  }
+}
+
+
+#样本密度函数
+library(mvtnorm)
+pdfs=numeric()
+for(i in 1:nrow(feat)){
+  pdfs[i]=sum(c(dmvnorm(x=as.numeric(feat[i,c(1,7,4,3,8)]),mean=em$parameters$mean[,1],sigma=em$parameters$variance$sigma[,,1]),dmvnorm(x=as.numeric(feat[i,c(1,7,4,3,8)]),mean=em$parameters$mean[,2],sigma=em$parameters$variance$sigma[,,2]),dmvnorm(x=as.numeric(feat[i,c(1,7,4,3,8)]),mean=em$parameters$mean[,3],sigma=em$parameters$variance$sigma[,,3]),dmvnorm(x=as.numeric(feat[i,c(1,7,4,3,8)]),mean=em$parameters$mean[,4],sigma=em$parameters$variance$sigma[,,4]),dmvnorm(x=as.numeric(feat[i,c(1,7,4,3,8)]),mean=em$parameters$mean[,5],sigma=em$parameters$variance$sigma[,,5]),dmvnorm(x=as.numeric(feat[i,c(1,7,4,3,8)]),mean=em$parameters$mean[,6],sigma=em$parameters$variance$sigma[,,6]),dmvnorm(x=as.numeric(feat[i,c(1,7,4,3,8)]),mean=em$parameters$mean[,7],sigma=em$parameters$variance$sigma[,,7]),dmvnorm(x=as.numeric(feat[i,c(1,7,4,3,8)]),mean=em$parameters$mean[,8],sigma=em$parameters$variance$sigma[,,8]),dmvnorm(x=as.numeric(feat[i,c(1,7,4,3,8)]),mean=em$parameters$mean[,9],sigma=em$parameters$variance$sigma[,,9]))*pp[feat$t[i]+32,])
+}
+probs=numeric() #simulation计算p-value
+for(i in 1:nrow(feat)){
+  probs[i]=length(which(density[,feat$t[i]+32]<=pdfs[i]))/10^6
+}
+ppost$prob_of_normal=probs
+#ppost$id=rep(1:3034,diff(c(0,which(feat$t==0))))
+ppost$logp=log10(probs)
+
+##这里没有用,失效
+#各类在t时刻的approp prob的分子
+z=data.frame(cbind(em$z,data$t)) #每个样本属于各类的后验概率
+colnames(z)=c("prob1","prob2","prob3","prob4","prob5","prob6","prob7","prob8","prob9","t")
+pr=data.frame(rep(NA,21))
+for(i in 1:9){
+  pr[,i]=tapply(z[,i],INDEX=z$t,FUN=sum) 
+}
+#各类在t时刻的approp prob
+appr_clust=pr/tapply(data[,1],FUN=length,INDEX=data$t)
+colnames(appr_clust)=c("appr1","appr2","appr3","appr4","appr5","appr6","appr7","appr8","appr9")
+#各时刻t的样本是正常状态的概率
+prob_of_normal=rowSums(prob*appr_clust[21+z$t,])
+z$prob_of_normal=prob_of_normal
+z$id=rep(1:3034,diff(c(0,which(z$t==0))))
+z$logp=log(z$prob_of_normal)
+
+
+#各样本低概率时长
+library(dplyr)
+countabnorm=data.frame(cnt=tapply(which(ppost$logp<(-0.5)),FUN=length,INDEX=ppost[which(ppost$logp<(-0.5)),]$id),id=as.numeric(unique(ppost[which(ppost$logp<(-0.5)),]$id)))
+count=data.frame(id=1:3034)
+count=left_join(count,countabnorm,by=c("id"="id"))
+count$cnt[is.na(count$cnt)]=0
+count$percent=count$cnt/tapply(ppost[,1],FUN=length,INDEX=ppost$id)
+#which(count$percent==1)
+
+#各样本p-value随时间变化图
+id=1
+#id=c(302,443,2124,2151,2607,2850,1580,1841,616)
+#which(count$percent>0.75)
+#656  738 1022 2680 2734,342,1580,2818,2853
+idplot=c(656,1337)
+for(id in idplot){
+plot(x=feat[ppost$id==id,"t"],y=ppost[ppost$id==id,"logp"],type="l",lwd=2,xlab="Time to Touchdown",ylab="Log(p-value)",main=paste("Log(p-value) VS Time id:",id),ylim=c(-1,0))
+abline(h=-0.4,col="red")
+}
+
+```
+
+
+##4.着陆后垂直过载的阻尼振动分析(没有用)
+```{r}
+#加入重量数据,线性插值填上间隔的
+add1=list.files("D:/THU PC/学习/科研/国航QAR/320_append3/demo4/A320",full.names=TRUE)
+WEIGHT=list()
+for(i in 1096:5128){
+  WEIGHT[[i]]=read.csv(add1[i],stringsAsFactors=FALSE,header=FALSE)[c(-1,-2,-4),c(1,6)]
+  colnames(WEIGHT[[i]])=WEIGHT[[i]][1,]
+  WEIGHT[[i]]=WEIGHT[[i]][-1,]
+  WEIGHT[[i]][,1]=as.numeric(WEIGHT[[i]][,1])
+  WEIGHT[[i]][,2]=as.numeric(WEIGHT[[i]][,2])
+  n=nrow(WEIGHT[[i]])
+  if(is.na(WEIGHT[[i]][1,2])==TRUE && is.na(WEIGHT[[i]][2,2])==FALSE){
+    WEIGHT[[i]][1,2]=WEIGHT[[i]][2,2]
+  }else if(is.na(WEIGHT[[i]][1,2])==TRUE && is.na(WEIGHT[[i]][2,2])==TRUE){
+    WEIGHT[[i]][1,2]=WEIGHT[[i]][3,2]
+    WEIGHT[[i]][2,2]=WEIGHT[[i]][3,2]
+  }
+  if(is.na(WEIGHT[[i]][n,2])==TRUE){
+    WEIGHT[[i]][n,2]=WEIGHT[[i]][(n-1),2]
+  }
+  for(j in which(is.na(WEIGHT[[i]][,2])==TRUE)){
+    WEIGHT[[i]][j,2]=(WEIGHT[[i]][j-1,2]+WEIGHT[[i]][j+1,2])/2
+  }
+  colnames(WEIGHT[[i]])[2]="weight"
+}
+
+library(dplyr)
+for(i in 1:5128){
+  a320[[i]]=left_join(a320[[i]],WEIGHT[[i]],by=c("line_index"="line_index"))
+}
+
+#对着陆后15s,阻尼振动各项参数拟合
+para=data.frame(t(rep(NA,5)))
+colnames(para)=c("a1","a2","t1","t2","m")
+for(i in 1:3034){ #37,346,417,1480
+  k=valid[c(1:3299)[-idabnorm]][i]
+  pitch=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+6),10:13])))
+  temp=rbind(pitch,c((pitch[-1]+pitch[-length(pitch)])/2,pitch[length(pitch)]))
+  pitch=as.numeric(unlist(temp))
+  dat=data.frame(acc=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+6),14:21]))),m=rep(a320[[k]][idlnd[k]:(idlnd[k]+6),"weight"],each=8),pitch=pitch,yaw=rep(a320[[k]][idlnd[k]:(idlnd[k]+6),40],each=8))
+  dat$transacc=dat$acc*cos(dat$pitch/180*pi)  #*cos(dat$yaw/180*pi)暂时不乘航向角的变换
+  a1=max(dat$acc)
+  t1=which.max(dat$acc)
+  dif=diff(dat$acc[t1:nrow(dat)])
+  l1=min(which(dif>0))
+  l2=min(which(dif[-1:-(l1-1)]<0))
+  t2=t1+l1-1+l2-1
+  a2=dat$acc[t2]
+  para[i,]=c(a1,a2,t1,t2,dat$m[1])
+}
+para$T=(para$t2-para$t1)/8  #T单位是1/8s！！
+para$w=2*pi/para$T
+para$beta=(log(para$a1-1)-log(para$a2-1))/para$T
+para$C=2*para$beta*para$m/100000  #重量以百吨为单位！
+para$w0=sqrt(para$w^2+para$beta^2)
+para$k=para$m*para$w0^2/100000  #重量以百吨为单位！
+
+#牛顿法曲线拟合得到更精确参数,上面的估计作为参数初始值
+paranew=data.frame(t(rep(NA,3)))
+colnames(paranew)=c("a1","beta","w")
+for(i in c(1:3034)[!is.na(para$beta)]){ #
+  k=valid[c(1:3299)[-idabnorm]][i]
+  dat=data.frame(acc=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+6),14:21])))[-1:(-para$t1[i]+1)][1:50]-1)  #取最高峰后10s,注意要减掉重力！！
+  dat$t=(0:49)/8
+  tryerr=try(
+  nls(acc~a1*exp(-beta*t)*cos(w*t),data=dat,start=list(a1=para$a1[i]-1,beta=para$beta[i],w=para$w[i]),trace=TRUE,algorithm="port",lower=c(0,0,0)),silent=F)
+  if(class(tryerr)!="try-error"){
+    vibfit=nls(acc~a1*exp(-beta*t)*cos(w*t),data=dat,start=list(a1=para$a1[i]-1,beta=para$beta[i],w=para$w[i]),trace=TRUE,algorithm="port",lower=c(0,0,0))
+    paranew[i,]=t(summary(vibfit)$coefficients[,1])
+  }
+}
+paranew$T=2*pi/paranew$w
+paranew$C=2*paranew$beta*para$m/100000  #重量以百吨为单位！
+paranew$w0=sqrt(paranew$w^2+paranew$beta^2)
+paranew$k=para$m*paranew$w0^2/100000  #重量以百吨为单位！
+
+#拟合效果检验
+i=1
+k=valid[c(1:3299)[-idabnorm]][i]
+after=unlist(t(a320[[k]][-1:(-idlnd[k]+1),14:21]))[-1:(-para$t1[i]+1)]
+plot(y=after,x=(1:length(after))/8,type="p",col="red",xlim=c(0,10),ylim=c(0,1.6),main=paste("id:",i),cex=0.5)
+x=seq(0,48)/8
+aa=summary(vibfit)$coefficients[,1]
+#y=(para$a1[i]-1)*exp(-para$beta[i]*x)*cos(para$w[i]*x)+1
+y=aa[1]*exp(-aa[2]*x)*cos(aa[3]*x)+1
+lines(x=x+1/8,y=y)
+points(y=after,x=1:length(after),cex=0.5)
+
+#真实重着陆样本完整数据读取
+addh=list.files("D:/THU PC/学习/科研/国航QAR/final/final vic/320系列重着陆导出数据/保留着陆后所有",full.names=TRUE)
+heavynew=list()
+idlndh=numeric()
+for(i in 1:6){
+  heavynew[[i]]=read.csv(addh[i],header=TRUE,stringsAsFactors=FALSE)[-1,-1:-2]
+  for(j in c(1:3,9:16,29:ncol(heavynew[[i]]))){
+    heavynew[[i]][,j]=as.numeric(heavynew[[i]][,j])
+  }
+  heavynew[[i]]$height=apply(heavynew[[i]][,9:12],MARGIN=1,FUN=mean)
+  heavynew[[i]]$pitch.agl=apply(heavynew[[i]][,41:44],MARGIN=1,FUN=mean)
+  heavynew[[i]]$maxacc=apply(heavynew[[i]][,32:39],MARGIN=1,FUN=max)
+  idlndh[i]=nrow(heavy320[[i]])-5
+}
+#着陆后15s,各项参数拟合,手动
+parah=data.frame(t(rep(NA,5)))
+colnames(parah)=c("a1","a2","t1","t2","m")
+for(k in 1:6){
+  pitch=as.numeric(unlist(t(heavynew[[k]][idlndh[k]:(idlndh[k]+6),41:44])))
+  temp=rbind(pitch,c((pitch[-1]+pitch[-length(pitch)])/2,pitch[length(pitch)]))
+  pitch=as.numeric(unlist(temp))
+  dat=data.frame(acc=as.numeric(unlist(t(heavynew[[k]][idlndh[k]:(idlndh[k]+6),32:39]))),m=rep(heavynew[[k]][idlndh[k]:(idlndh[k]+6),108],each=8),pitch=pitch,yaw=rep(heavynew[[k]][idlndh[k]:(idlndh[k]+6),91],each=8))
+  dat$transacc=dat$acc*cos(dat$pitch/180*pi)  #*cos(dat$yaw/180*pi)暂时不乘航向角的变换
+  a1=max(dat$acc)
+  t1=which.max(dat$acc)
+  dif=diff(dat$acc[t1:nrow(dat)])
+  l1=min(which(dif>0))
+  l2=min(which(dif[-1:-(l1-1)]<0))
+  t2=t1+l1-1+l2-1
+  a2=dat$acc[t2]
+  parah[k,]=c(a1,a2,t1,t2,dat$m[1])
+}
+parah$T=(parah$t2-parah$t1)/8  #T单位是1/8s！！
+parah$w=2*pi/parah$T
+parah$beta=(log(parah$a1-1)-log(parah$a2-1))/parah$T
+parah$C=2*parah$beta*parah$m/100000  #重量以百吨为单位！
+parah$w0=sqrt(parah$w^2+parah$beta^2)
+parah$k=parah$m*parah$w0^2/100000  #重量以百吨为单位！
+
+#牛顿法曲线拟合得到更精确参数,上面的估计作为参数初始值
+parahnew=data.frame(t(rep(NA,3)))
+colnames(parahnew)=c("a1","beta","w")
+for(k in 1:6){
+  dat=data.frame(acc=as.numeric(unlist(t(heavynew[[k]][idlndh[k]:(idlndh[k]+6),32:39])))[-1:(-parah$t1[k]+1)][1:50]-1)  #取最高峰后10s,注意要减掉重力！！
+  dat$t=(0:49)/8
+  tryerr=try(
+  nls(acc~a1*exp(-beta*t)*cos(w*t),data=dat,start=list(a1=parah$a1[k]-1,beta=parah$beta[k],w=parah$w[k]),trace=TRUE,lower=c(0,0,0)),silent=F)
+  if(class(tryerr)!="try-error"){
+    vibfit=nls(acc~a1*exp(-beta*t)*cos(w*t),data=dat,start=list(a1=parah$a1[k]-1,beta=parah$beta[k],w=parah$w[k]),trace=TRUE,lower=c(0,0,0),weights=c(5,rep(1,parah$t2[k]-parah$t1[k]-1),5,rep(1,50-parah$t2[k]+parah$t1[k]-1)))  #给最高峰和次高峰加权!!
+    parahnew[k,]=t(summary(vibfit)$coefficients[,1])
+  }
+}
+parahnew$T=2*pi/parahnew$w
+parahnew$C=2*parahnew$beta*parah$m/100000  #重量以百吨为单位！
+parahnew$w0=sqrt(parahnew$w^2+parahnew$beta^2)
+parahnew$k=parah$m*parahnew$w0^2/100000  #重量以百吨为单位！
+parahnew$a1=parah$a1-1
+
+
+#拟合效果检验
+i=1
+n=nrow(heavynew[[i]])
+after=unlist(t(heavynew[[i]][-1:(-idlndh[i]+1),32:39]))[-1:(-parah$t1[i]+1)]
+plot(y=after,x=(1:length(after))/8,type="p",col="red",xlim=c(0,10),main=paste("heavy",i))
+x=seq(0,48)/8
+aa=parah[i,]
+y=as.numeric(aa[1])*exp(-as.numeric(aa[2])*x)*cos(as.numeric(aa[3])*x)+1
+lines(x=x+1/8,y=y)
+points(y=after,x=1:length(after),cex=0.5)
+
+
+
+#各参数密度图
+ggplot(paranew,aes(x=a1))+geom_density(aes(fill=I("#6baed6"),col=I("#6baed6"),alpha=I(0.6)))+theme(plot.title=element_text(hjust=0.5))+labs(x="maxA",title="Density Plot of maxA")
+ggplot(paranew,aes(x=T))+geom_density(aes(fill=I("#6baed6"),col=I("#6baed6"),alpha=I(0.6)))+theme(plot.title=element_text(hjust=0.5))+labs(x="T",title="Density Plot of T")
+ggplot(paranew,aes(x=beta))+geom_density(aes(fill=I("#6baed6"),col=I("#6baed6"),alpha=I(0.6)))+theme(plot.title=element_text(hjust=0.5))+labs(x="Beta",title="Density Plot of Beta")
+ggplot(paranew,aes(x=C))+geom_density(aes(fill=I("#6baed6"),col=I("#6baed6"),alpha=I(0.6)))+theme(plot.title=element_text(hjust=0.5))+labs(x="C",title="Density Plot of C")
+ggplot(paranew,aes(x=w0))+geom_density(aes(fill=I("#6baed6"),col=I("#6baed6"),alpha=I(0.6)),bw=0.5)+theme(plot.title=element_text(hjust=0.5))+labs(x="w0",title="Density Plot of w0")
+ggplot(paranew,aes(x=k))+geom_density(aes(fill=I("#6baed6"),col=I("#6baed6"),alpha=I(0.6)),bw=4)+theme(plot.title=element_text(hjust=0.5))+labs(x="k",title="Density Plot of k")
+
+#a1和beta散点图
+ggplot(data.frame(a1=c(paranew$a1,parahnew$a1),beta=c(paranew$beta,parahnew$beta),ifHardLanding=ifhigh),aes(x=beta,y=a1,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="Beta",y="maxA",title="maxA VS Beta")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))+xlim(c(0,5))
+
+ggplot(data.frame(a1=c(paranew$a1,parahnew$a1),coef=c(paranew$C,parahnew$C),ifHardLanding=ifhigh),aes(x=coef,y=a1,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="C",y="maxA",title="maxA VS C")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))+xlim(c(0,5))
+
+ggplot(data.frame(a1=c(paranew$a1,parahnew$a1),beta=c(paranew$T,parahnew$T),ifHardLanding=ifhigh),aes(x=beta,y=a1,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="T",y="maxA",title="maxA VS T")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))+xlim(c(0.5,2.5))
+
+ggplot(data.frame(a1=c(paranew$a1,parahnew$a1),beta=c(paranew$w0,parahnew$w0),ifHardLanding=ifhigh),aes(x=beta,y=a1,col=ifHardLanding,alpha=I(alpha),cex=I(cex)))+geom_point()+labs(x="w0",y="maxA",title="maxA VS w0")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))+xlim(c(0,20))
+
+
+#只针对着陆加速度大的做分解分析
+idvib=which(alnd>1.3)
+#拟合效果检验
+i=sample(idvib,size=1)
+k=valid[c(1:3299)[-idabnorm]][i]
+after=unlist(t(a320[[k]][-1:(-idlnd[k]+1),14:21]))[-1:(-para$t1[i]+1)]
+plot(y=after,x=(1:length(after))/8,type="p",col="red",xlim=c(0,10),ylim=c(0,1.6),main=paste("id:",i),cex=0.5)
+```
+
+##4.着陆后垂直过载阻尼振动分解分析
+```{r}
+#对着陆后13s观测点,阻尼振动各项参数拟合
+#只研究着陆垂直过载超过1.35g的样本(5%)
+
+##1 谱分析找阻尼振动周期
+idheavylnd=which(alnd[-idabnorm]>1.35)
+paravib=data.frame(t(rep(NA,5)))
+colnames(paravib)=c("a1","t1","a2","t2","t")
+for(i in idheavylnd){
+  k=valid[c(1:3299)[-idabnorm]][i]
+  pitch=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+12),10:13])))
+  temp=rbind(pitch,c((pitch[-1]+pitch[-length(pitch)])/2,pitch[length(pitch)]))
+  pitch=as.numeric(unlist(temp))
+  dat=data.frame(acc=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+12),14:21]))),pitch=pitch,yaw=rep(a320[[k]][idlnd[k]:(idlnd[k]+12),40],each=8))
+  dat$transacc=dat$acc*cos(dat$pitch/180*pi)  #*cos(dat$yaw/180*pi)暂时不乘航向角的变换
+  
+  a1=max(dat$acc)-1 #找最高点
+  t1=which.max(dat$acc)
+  if(t1!=1){
+    t2=top2(dat$acc[-1:(-t1+1)])+t1-1 #找第2个峰值
+  }else{
+    t2=top2(dat$acc)+t1-1 #找第2个峰值
+  }
+  a2=dat$acc[t2]-1
+  #从第2个峰往后求阻尼振动周期，频谱分析
+  specanlz=spectrum(dat$acc[-1:(-t2+1)],method="ar",plot=FALSE)
+  freq=specanlz$freq[which.max(specanlz$spec)]
+  t=1/freq  #单位是1/8s
+  paravib[i,]=c(a1,t1,a2,t2,t)
+}
+summary(paravib) #1103比较奇怪
+
+#找第二个峰值
+top2=function(x){
+  id=numeric()
+  for(i in 4:(length(x)-2)){
+    if(diff(x)[i-2]>0 && diff(x)[i-1]>0 && diff(x)[i]<=0 && diff(x)[i+1]<=0){
+      id=c(id,i)
+    }
+  }
+  return(min(id))
+}
+#找波峰
+crest=function(x){
+  id=numeric()
+  for(i in 4:(length(x)-2)){
+    if(diff(x)[i-2]>0 && diff(x)[i-1]>0 &&diff(x)[i]<=0 && diff(x)[i+1]<=0){
+      id=c(id,i)
+    }
+  }
+  return(id)
+}
+#找波谷
+valley=function(x){
+  id=numeric()
+  for(i in 3:(length(x)-2)){
+    if(diff(x)[i-2]<0 && diff(x)[i-1]<=0 && diff(x)[i]>0 && diff(x)[i+1]>=0){
+      id=c(id,i)
+    }
+  }
+  return(id)
+}
+
+
+##2 拟合阻尼系数beta
+#id=sample(1:length(idheavylnd),1)
+for(i in idheavylnd){
+  k=valid[c(1:3299)[-idabnorm]][i]
+  
+  acc=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+12),14:21])))
+  crestid=crest(acc[-1:(-paravib[i,"t2"]+1)])+paravib[i,"t2"]-1 #波峰
+  valleyid=valley(acc[-1:(-paravib[i,"t2"]+1)])+paravib[i,"t2"]-1 #波谷
+  #topid=sort(c(crestid, valleyid))
+  #截取波峰波谷间相差整周期的id
+  
+  if(min(which(diff(crestid)%in%c(5:9)==FALSE))!=Inf){
+    crestid=crestid[1:min(which(diff(crestid)%in%c(5:9)==FALSE))]
+  }
+  if(min(which(diff(valleyid)%in%c(5:9)==FALSE))!=Inf){
+    valleyid=valleyid[1:min(which(diff(valleyid)%in%c(5:9)==FALSE))]
+  }
+  if(length(crestid)>1 && length(valleyid)>1){
+    y=acc[c(crestid[-1],valleyid[-1])]-1
+    x=acc[c(crestid[-length(crestid)],valleyid[-length(valleyid)])]-1
+    fit=lm(y~x-1)
+    paravib[i,"beta"]=-log(fit$coefficients)/paravib[i,"t"]*8   #单位是1/s
+  }else if(length(crestid)>1 && length(valleyid)==1){
+    y=acc[crestid[-1]]-1
+    x=acc[crestid[-length(crestid)]]-1
+    fit=lm(y~x-1)
+    paravib[i,"beta"]=-log(fit$coefficients)/paravib[i,"t"]*8   #单位是1/s
+  }else if(length(crestid)==1 && length(valleyid)>1){
+    y=acc[valleyid[-1]]-1
+    x=acc[valleyid[-length(valleyid)]]-1
+    fit=lm(y~x-1)
+    paravib[i,"beta"]=-log(fit$coefficients)/paravib[i,"t"]*8   #单位是1/s
+  }else{
+    paravib[i,"beta"]=0
+  }
+}
+#没有学到beta的特殊的
+id1=which(paravib$beta==0)  #衰减很快可直接忽略
+#beta<0的特殊的
+id2=which(paravib$beta<0) #id=2364,2532,衰减很快可直接忽略
+#从高着陆acc样本里去掉上述特殊的样本
+idheavylnd=setdiff(idheavylnd,union(id1,id2))
+
+#检验波峰波谷找的对不对
+#i=which(paravib$beta==0)[1]
+#k=valid[c(1:3299)[-idabnorm]][i]
+#acc=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+12),14:21])))
+crestid=crest(acc[-1:(-paravib[i,"t2"]+1)])+paravib[i,"t2"]-1 #波峰
+valleyid=valley(acc[-1:(-paravib[i,"t2"]+1)])+paravib[i,"t2"]-1 #波谷
+plot(y=acc,x=(1:length(acc))/8,type="p",col=1,xlim=c(0,10),ylim=c(0.5,1.6),main=paste("id:",i),cex=0.5)
+lines(y=acc,x=(1:length(acc))/8,type="l",col="red",cex=0.5)
+points(y=acc[crestid],x=((1:length(acc))[crestid])/8,col="blue",cex=0.5,pch=2)
+plot(y=acc,x=(1:length(acc))/8,type="p",col=1,xlim=c(0,10),ylim=c(0.5,1.6),main=paste("id:",i),cex=0.5)
+lines(y=acc,x=(1:length(acc))/8,type="l",col="red",cex=0.5)
+points(y=acc[valleyid],x=((1:length(acc))[valleyid])/8,col="blue",cex=0.5,pch=2)
+
+
+
+##3 实际与拟合的阻尼振动差值序列分析
+for(i in idheavylnd){
+  k=valid[c(1:3299)[-idabnorm]][i]
+  acc=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+12),14:21])))
+  
+  amp=paravib[i,"a2"]/exp(-paravib[i,"beta"]*paravib[i,"t2"]/8)
+  t=(1:(13*8))/8
+  y=amp*exp(-paravib[i,"beta"]*t)*cos(2*pi/paravib[i,"t"]*8*t-2*pi/paravib[i,"t"]*8*paravib[i,"t2"]/8)  #固定t=t2时相位为0
+  dify=acc-1-y
+  
+  #取第2峰值前绝对差值的最大值,作为冲击大小的反映
+  paravib[i,"maxdif"]=max(abs(dify)[1:paravib[i,"t2"]])
+}
+#查看差值序列
+plot(y=acc,x=t,main=paste("id:",i),cex=0.5,type="l",ylim=c(-0.3,1.6))
+points(y=acc,x=t,cex=0.5)
+points(y=y+1,x=t,cex=0.5,col="blue")
+lines(y=y+1,x=t,cex=0.5,col="blue")
+points(y=dify,x=t,cex=0.5,col="red")
+lines(y=dify,x=t,cex=0.5,col="red")
+
+
+##重着陆航班着陆后分析
+##1 谱分析找阻尼振动周期
+paravibh=data.frame(t(rep(NA,5)))
+colnames(paravibh)=c("a1","t1","a2","t2","t")
+for(i in 1:6){
+  acc=as.numeric(unlist(t(heavynew[[i]][idlndh[i]:(idlndh[i]+12),32:39])))
+  
+  a1=max(acc)-1 #找最高点
+  t1=which.max(acc)
+  if(t1!=1){
+    t2=top2(acc[-1:(-t1+1)])+t1-1 #找第2个峰值
+  }else{
+    t2=top2(acc)+t1-1 #找第2个峰值
+  }
+  a2=acc[t2]-1
+  #从第2个峰往后求阻尼振动周期，频谱分析
+  specanlz=spectrum(acc[-1:(-t2+1)],method="ar",plot=FALSE)
+  freq=specanlz$freq[which.max(specanlz$spec)]
+  t=1/freq  #单位是1/8s
+  paravibh[i,]=c(a1,t1,a2,t2,t)
+}
+summary(paravibh)
+#heavy4的t2找的不对,手动修改
+for(i in 4){
+  acc=as.numeric(unlist(t(heavynew[[i]][idlndh[i]:(idlndh[i]+12),32:39])))
+  
+  a1=max(acc)-1 #找最高点
+  t1=which.max(acc)
+  t2=19
+  a2=acc[t2]-1
+  #从第2个峰往后求阻尼振动周期，频谱分析
+  specanlz=spectrum(acc[-1:(-t2+1)],method="ar",plot=FALSE)
+  freq=specanlz$freq[which.max(specanlz$spec)]
+  t=1/freq  #单位是1/8s
+  paravibh[i,]=c(a1,t1,a2,t2,t)
+}
+
+##2 拟合阻尼系数beta
+for(i in 1:6){
+  acc=as.numeric(unlist(t(heavynew[[i]][idlndh[i]:(idlndh[i]+12),32:39])))
+  crestid=crest(acc[-1:(-paravibh[i,"t2"]+1)])+paravibh[i,"t2"]-1 #波峰
+  valleyid=valley(acc[-1:(-paravibh[i,"t2"]+1)])+paravibh[i,"t2"]-1 #波谷
+  #截取波峰波谷间相差整周期的id
+  if(min(which(diff(crestid)%in%c(5:9)==FALSE))!=Inf){
+    crestid=crestid[1:min(which(diff(crestid)%in%c(5:9)==FALSE))]
+  }
+  if(min(which(diff(valleyid)%in%c(5:9)==FALSE))!=Inf){
+    valleyid=valleyid[1:min(which(diff(valleyid)%in%c(5:9)==FALSE))]
+  }
+  if(length(crestid)>1 && length(valleyid)>1){
+    y=acc[c(crestid[-1],valleyid[-1])]-1
+    x=acc[c(crestid[-length(crestid)],valleyid[-length(valleyid)])]-1
+    fit=lm(y~x-1)
+    paravibh[i,"beta"]=-log(fit$coefficients)/paravibh[i,"t"]*8   #单位是1/s
+  }else if(length(crestid)>1 && length(valleyid)==1){
+    y=acc[crestid[-1]]-1
+    x=acc[crestid[-length(crestid)]]-1
+    fit=lm(y~x-1)
+    paravibh[i,"beta"]=-log(fit$coefficients)/paravibh[i,"t"]*8   #单位是1/s
+  }else if(length(crestid)==1 && length(valleyid)>1){
+    y=acc[valleyid[-1]]-1
+    x=acc[valleyid[-length(valleyid)]]-1
+    fit=lm(y~x-1)
+    paravibh[i,"beta"]=-log(fit$coefficients)/paravibh[i,"t"]*8   #单位是1/s
+  }else{
+    paravibh[i,"beta"]=0
+  }
+}
+##3 实际与拟合的阻尼振动差值序列分析
+for(i in 1:6){
+  acc=as.numeric(unlist(t(heavynew[[i]][idlndh[i]:(idlndh[i]+12),32:39])))
+  amp=paravibh[i,"a2"]/exp(-paravibh[i,"beta"]*paravibh[i,"t2"]/8)
+  t=(1:(13*8))/8
+  y=amp*exp(-paravibh[i,"beta"]*t)*cos(2*pi/paravibh[i,"t"]*8*t-2*pi/paravibh[i,"t"]*8*paravibh[i,"t2"]/8)  #固定t=t2时相位为0
+  dify=acc-1-y
+  
+  #取第2峰值前绝对差值的最大值,作为冲击大小的反映
+  paravibh[i,"maxdif"]=max(abs(dify)[1:paravibh[i,"t2"]])
+}
+#查看差值序列
+plot(y=acc,x=t,main=paste("heavy",i),lwd=2,type="l",ylim=c(-0.3,3),xlab="Time after Touchdown/s",ylab="NormalAcc")
+points(y=acc,x=t,cex=0.5)
+#points(y=y+1,x=t,cex=0.5,col="blue")
+lines(y=y+1,x=t,cex=0.5,col="blue")
+#points(y=dify[1:paravibh[i,"t2"]],x=t[1:paravibh[i,"t2"]],cex=0.5,col="red")
+lines(y=abs(dify[1:paravibh[i,"t2"]]),x=t[1:paravibh[i,"t2"]],lwd=0.5,col="red",cex=1.5)
+abline(v=paravibh[i,"t2"]/8,col="grey50")
+text(x=10,y=2.5,labels=paste("beta:",round(paravibh[i,"beta"],2)))
+text(x=10,y=2,labels=paste("maxdiff:",round(paravibh[i,"maxdif"],2)))
+
+#判定beta小/不大且差值序列大的为危险航班
+#高alnd举例
+i=616
+k=valid[c(1:3299)[-idabnorm]][i]
+acc=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+12),14:21])))
+amp=paravib[i,"a2"]/exp(-paravib[i,"beta"]*paravib[i,"t2"]/8)
+t=(1:(13*8))/8
+y=amp*exp(-paravib[i,"beta"]*t)*cos(2*pi/paravib[i,"t"]*8*t-2*pi/paravib[i,"t"]*8*paravib[i,"t2"]/8)  #固定t=t2时相位为0
+dify=acc-1-y
+#查看差值序列
+plot(y=acc,x=t,main=paste("id:",i),lwd=2,type="l",ylim=c(0,3),xlab="Time after Touchdown/s",ylab="NormalAcc")
+points(y=acc,x=t,cex=0.5)
+#points(y=y+1,x=t,cex=0.5,col="blue")
+lines(y=y+1,x=t,cex=0.5,col="blue")
+#points(y=dify[1:paravibh[i,"t2"]],x=t[1:paravibh[i,"t2"]],cex=0.5,col="red")
+lines(y=abs(dify[1:paravib[i,"t2"]]),x=t[1:paravib[i,"t2"]],lwd=0.5,col="red",cex=1.5)
+abline(v=paravib[i,"t2"]/8,col="grey50")
+text(x=10,y=2.5,labels=paste("beta:",round(paravib[i,"beta"],2)))
+text(x=10,y=2,labels=paste("maxdiff:",round(paravib[i,"maxdif"],2)))
+
+#maxdif和beta散点图
+ggplot(data.frame(maxdif=c(paravib$maxdif,paravibh$maxdif),beta=c(paravib$beta,paravibh$beta),ifHardLanding=ifhigh[-3027:-3034]),aes(x=beta,y=maxdif,col=ifHardLanding,alpha=I(alpha[-3027:-3034]),cex=I(cex[-3027:-3034])))+geom_point()+labs(x="Beta",y="MaxDiff",title="MaxDiff VS Beta")+theme(plot.title=element_text(hjust=0.5))+scale_color_manual(values=c("#EEEE00","#FF6A6A","#78c679","#5CACEE","#DAA520"))+xlim(c(0,3))+ylim(c(0,5))+geom_segment(aes(x=0.7,xend=0.7,y=0.8,yend=5,size=1),col="grey50")+geom_segment(aes(x=0,xend=0.7,y=0.8,yend=0.8,size=1),col="grey50")
+
+
+##全样本着陆后参数学习
+##1 谱分析找阻尼振动周期
+paravib1=data.frame(t(rep(NA,5)))
+colnames(paravib1)=c("a1","t1","a2","t2","t")
+for(i in 1:3034){
+  k=valid[c(1:3299)[-idabnorm]][i]
+  pitch=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+12),10:13])))
+  temp=rbind(pitch,c((pitch[-1]+pitch[-length(pitch)])/2,pitch[length(pitch)]))
+  pitch=as.numeric(unlist(temp))
+  dat=data.frame(acc=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+12),14:21]))),pitch=pitch,yaw=rep(a320[[k]][idlnd[k]:(idlnd[k]+12),40],each=8))
+  dat$transacc=dat$acc*cos(dat$pitch/180*pi)  #*cos(dat$yaw/180*pi)暂时不乘航向角的变换
+  
+  a1=max(dat$acc)-1 #找最高点
+  t1=which.max(dat$acc)
+  if(t1!=1){
+    t2=top2(dat$acc[-1:(-t1+1)])+t1-1 #找第2个峰值
+  }else{
+    t2=top2(dat$acc)+t1-1 #找第2个峰值
+  }
+  if(t2==Inf){
+    next
+  }
+  a2=dat$acc[t2]-1
+  #从第2个峰往后求阻尼振动周期，频谱分析
+  specanlz=spectrum(dat$acc[-1:(-t2+1)],method="ar",plot=FALSE)
+  freq=specanlz$freq[which.max(specanlz$spec)]
+  t=1/freq  #单位是1/8s
+  paravib1[i,]=c(a1,t1,a2,t2,t)
+}
+summary(paravib1)
+idvib=union(which(paravib1$t==Inf),which(is.na(paravib1$t)==TRUE))  #阻尼振动异常的航班
+
+##2 拟合阻尼系数beta
+for(i in setdiff(1:3034,idvib)){  #417,2027,2028
+  k=valid[c(1:3299)[-idabnorm]][i]
+  
+  acc=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+12),14:21])))
+  crestid=crest(acc[-1:(-paravib1[i,"t2"]+1)])+paravib1[i,"t2"]-1 #波峰
+  valleyid=valley(acc[-1:(-paravib1[i,"t2"]+1)])+paravib1[i,"t2"]-1 #波谷
+  #截取波峰波谷间相差整周期的id
+  
+  if(min(which(diff(crestid)%in%c(5:9)==FALSE))!=Inf){
+    crestid=crestid[1:min(which(diff(crestid)%in%c(5:9)==FALSE))]
+  }
+  if(min(which(diff(valleyid)%in%c(5:9)==FALSE))!=Inf){
+    valleyid=valleyid[1:min(which(diff(valleyid)%in%c(5:9)==FALSE))]
+  }
+  if(length(crestid)>1 && length(valleyid)>1){
+    y=acc[c(crestid[-1],valleyid[-1])]-1
+    x=acc[c(crestid[-length(crestid)],valleyid[-length(valleyid)])]-1
+    fit=lm(y~x-1)
+    paravib1[i,"beta"]=-log(fit$coefficients)/paravib1[i,"t"]*8   #单位是1/s
+  }else if(length(crestid)>1 && length(valleyid)==1){
+    y=acc[crestid[-1]]-1
+    x=acc[crestid[-length(crestid)]]-1
+    fit=lm(y~x-1)
+    paravib1[i,"beta"]=-log(fit$coefficients)/paravib1[i,"t"]*8   #单位是1/s
+  }else if(length(crestid)==1 && length(valleyid)>1){
+    y=acc[valleyid[-1]]-1
+    x=acc[valleyid[-length(valleyid)]]-1
+    fit=lm(y~x-1)
+    paravib1[i,"beta"]=-log(fit$coefficients)/paravib1[i,"t"]*8   #单位是1/s
+  }else{
+    paravib1[i,"beta"]=0
+  }
+}
+#没有学到beta的特殊的
+id1=which(is.na(paravib1$beta)==TRUE)  #可能是因为振动不明显,波峰波谷判断不准确,拟合出来系数为负
+#beta<=0的特殊的
+id2=which(paravib1$beta<=0) #id=2364,2532,衰减很快可直接忽略
+#特殊的样本id
+idvib=union(idvib,union(id1,id2))
+#beta无穷大的
+id3=which(paravib1$beta==Inf)  #说明coef=0,衰减很快
+idvib=union(idvib,id3)
+
+#检验波峰波谷找的对不对
+#i=which(paravib1$beta==0)[1]
+#k=valid[c(1:3299)[-idabnorm]][i]
+#acc=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+12),14:21])))
+crestid=crest(acc[-1:(-paravib1[i,"t2"]+1)])+paravib1[i,"t2"]-1 #波峰
+valleyid=valley(acc[-1:(-paravib1[i,"t2"]+1)])+paravib1[i,"t2"]-1 #波谷
+plot(y=acc,x=(1:length(acc))/8,type="p",col=1,xlim=c(0,10),ylim=c(0.5,1.6),main=paste("id:",i),cex=0.5)
+lines(y=acc,x=(1:length(acc))/8,type="l",col="red",cex=0.5)
+points(y=acc[crestid],x=((1:length(acc))[crestid])/8,col="blue",cex=0.5,pch=2)
+plot(y=acc,x=(1:length(acc))/8,type="p",col=1,xlim=c(0,10),ylim=c(0.5,1.6),main=paste("id:",i),cex=0.5)
+lines(y=acc,x=(1:length(acc))/8,type="l",col="red",cex=0.5)
+points(y=acc[valleyid],x=((1:length(acc))[valleyid])/8,col="blue",cex=0.5,pch=2)
+
+##3 实际与拟合的阻尼振动差值序列分析
+for(i in setdiff(1:3034,idvib)){
+  k=valid[c(1:3299)[-idabnorm]][i]
+  acc=as.numeric(unlist(t(a320[[k]][idlnd[k]:(idlnd[k]+12),14:21])))
+  
+  amp=paravib1[i,"a2"]/exp(-paravib1[i,"beta"]*paravib1[i,"t2"]/8)
+  t=(1:(13*8))/8
+  y=amp*exp(-paravib1[i,"beta"]*t)*cos(2*pi/paravib1[i,"t"]*8*t-2*pi/paravib1[i,"t"]*8*paravib1[i,"t2"]/8)  #固定t=t2时相位为0
+  dify=acc-1-y
+  
+  #取第2峰值前绝对差值的最大值,作为冲击大小的反映
+  paravib1[i,"maxdif"]=max(abs(dify)[1:paravib1[i,"t2"]])
+}
+
+
+```
+
+###Part2 飞行员操作分析
+##1.建立动力学模型(没有用)
+```{r}
+#合并所有320航班
+rawdata=data.frame(t(rep(NA,24)))
+colind1=c(1,41,64,65,70,38,68,69,71,82,81)
+colnam=c("vy","vx","h","pitch","roll","vwind","vpara","vvert","dist","weight","t","throttle","airspd")
+colnames(rawdata)=c(colnam,paste(colnam[c(-3,-9,-11)],rep(1,10),sep=""),"id")
+
+id600=numeric()
+for(i in 1:3034){
+  k=valid[c(1:3299)[-idabnorm]][i]
+  id600[k]=max(which(a320[[k]]$height>600))+1
+  a320[[k]][,73]=as.numeric(a320[[k]][,73])
+  a320[[k]][,74]=as.numeric(a320[[k]][,74])
+  a320[[k]][,75]=as.numeric(a320[[k]][,75])
+  a320[[k]][,76]=as.numeric(a320[[k]][,76])
+  throttle=rowMeans(a320[[k]][,73:76])
+  airspd=rowMeans(a320[[k]][,42:43])
+  
+  dat=cbind(a320[[k]][(id600[k]+1):idlnd[k],colind1],throttle[(id600[k]+1):idlnd[k]],airspd[(id600[k]+1):idlnd[k]],a320[[k]][id600[k]:(idlnd[k]-1),colind1[c(-3,-9,-11)]],throttle[id600[k]:(idlnd[k]-1)],airspd[id600[k]:(idlnd[k]-1)],rep(i,idlnd[k]-id600[k]))
+  colnames(dat)=c(colnam,paste(colnam[c(-3,-9,-11)],rep(1,10),sep=""),"id")
+  rawdata=rbind(rawdata,dat)
+}
+rawdata=rawdata[-1,]
+
+rawdata1=rawdata
+rawdata1$deltavy=rawdata1$vy-rawdata1$vy1
+#俯仰角单位由度变成rad
+rawdata1$pitch=rawdata$pitch*pi/180
+rawdata1$pitch1=rawdata$pitch1*pi/180
+#速度与水平夹角(用竖直速度和空速算)
+rawdata1$beta=rawdata1$vy/rawdata1$airspd/6076.1154856*60
+rawdata1$beta1=rawdata1$vy1/rawdata1$airspd1/6076.1154856*60
+rawdata1$betanew=rawdata1$vy/rawdata1$airspd1/6076.1154856*60
+#迎角计算(俯仰角+速度与水平夹角？)
+rawdata1$attack=rawdata1$pitch+rawdata1$beta
+rawdata1$attack1=rawdata1$pitch1+rawdata1$beta1
+rawdata1$attacknew=rawdata1$pitch+rawdata1$betanew
+#升力竖直分量
+rawdata1$lift=(rawdata1$airspd*6076.1154856/60)^2/rawdata1$weight*rawdata1$attack
+rawdata1$lift1=(rawdata1$airspd1*6076.1154856/60)^2/rawdata1$weight1*rawdata1$attack1
+rawdata1$liftnew=(rawdata1$airspd1*6076.1154856/60)^2/rawdata1$weight1*rawdata1$attacknew
+#前1s顺逆风分开(没有用)
+rawdata1$vshun1=rawdata1$vpara1
+rawdata1$vshun1[(rawdata1$vshun1)<0]=0
+rawdata1$vni1=rawdata1$vpara1
+rawdata1$vni1[(rawdata1$vni1)>0]=0
+#推力竖直分量(没有用,在手动之前的throttle杆位没有意义)
+rawdata1$tui=rawdata1$throttle*sin(rawdata1$pitch)
+rawdata1$tui1=rawdata1$throttle1*sin(rawdata1$pitch1)
+#加一个总空气动力airforce(没有用,升力竖直分量是airforce*attack)
+rawdata1$airforce=rawdata1$airspd^2/rawdata1$weight
+rawdata1$airforce1=rawdata1$airspd1^2/rawdata1$weight1
+
+
+#各变量间散点图
+pairs(~deltavy+vwind+airforce+airforce1+attack+attack1+pitch+pitch1+lift+lift1+tui+tui1,data=rawdata1[sample(nrow(rawdata1),10000),])
+
+##拟合动力学方程(不考虑推力)
+library(car)
+#预回归,拟合找异常值
+fitw=lm(vy~vwind+vy1+pitch+pitch1+roll+roll1+lift1,data=rawdata1)
+summary(fitw)
+#weigh=1/abs(1-coefficients(fitw)[6]*rawdata1$airspd1*6076.1154856/60/rawdata1$weight1)
+
+#去掉outlier后的回归
+qup=quantile(fitw$residuals,probs=0.975)
+qlow=quantile(fitw$residuals,probs=0.025)
+out=c(which(fitw$residuals>qup),which(fitw$residuals<qlow))
+infp=which(cooks.distance(fitw)>4/(nrow(rawdata1)-7-1))
+#去掉outlier之后的5变量线性回归
+fitw.rem=lm(vy~vwind+vy1+pitch+pitch1+roll+roll1+lift1,data=rawdata1[-union(out,infp),])
+summary(fitw.rem)
+plot(fitw.rem)
+#weigh=1/abs(1-coefficients(fitw.rem)[6]*rawdata1$airspd1[-union(out,infp)]*6076.1154856/60/rawdata1$weight1[-union(out,infp)])
+#fitw.rem1=lm(deltavy~vwind+pitch+pitch1+lift1+liftnew,data=rawdata1[-union(out,infp),],weights=weigh)
+#summary(fitw.rem1)
+
+#看下散点图
+pairs(~vy.delta+v_wind+liftvy+liftvy1+throttle.agl+throttle.pre1+pitch.agl+pitch.pre1,data=temp1[-c(out,infp),][sample(nrow(temp1[-c(out,infp),]),20000),])
+
+##lme模型(不考虑推力,两阶段回归)
+library(lme4)
+fitm=lmer(vy~vy1+pitch+pitch1+roll+roll1+lift1+(1|vwind),data=rawdata1[-union(out,infp)])
+summary(fitm)
+plot(x=fitted(fitm1),y=resid(fitm1))
+abline(h=0,col="red")
+#诊断qqplot
+qqnorm(y=resid(fitm))
+qqline(y=resid(fitm))
+
+# rawdata1$pitchw=rawdata1$pitch/(1-coefficients(summary(fitm))[5]*rawdata1$airspd1*6076.1154856/60/rawdata1$weight1)
+# rawdata1$pitch1w=rawdata1$pitch1/(1-coefficients(summary(fitm))[5]*rawdata1$airspd1*6076.1154856/60/rawdata1$weight1)
+# rawdata1$lift1w=rawdata1$lift1/(1-coefficients(summary(fitm))[5]*rawdata1$airspd1*6076.1154856/60/rawdata1$weight1)
+# rawdata1$lw=rawdata1$l/(1-coefficients(summary(fitm))[5]*rawdata1$airspd1*6076.1154856/60/rawdata1$weight1)
+# rawdata1$vy1w=rawdata1$vy1/(1-coefficients(summary(fitm))[5]*rawdata1$airspd1*6076.1154856/60/rawdata1$weight1)
+# rawdata1$l=rawdata1$liftnew-rawdata1$airspd1*6076.1154856/60/rawdata1$weight1*rawdata1$vy
+
+```
+
+#1.动力学模型（只用200-20ft数据）
+```{r}
+#合并所有320航班
+rawdata=data.frame(t(rep(NA,25)))
+colind1=c(1,41,64,65,70,38,68,69,71,82,81)
+colnam=c("vy","vx","h","pitch","roll","vwind","vpara","vvert","dist","weight","t")
+colnames(rawdata)=c(colnam,paste(colnam[c(-3,-9,-11)],rep(1,8),sep=""),paste(colnam[c(1,4,5,7,10)],rep(2,5),sep=""),"id")
+
+id200new=numeric()
+id20new=numeric()
+for(i in 1:3034){
+  k=valid[c(1:3299)[-idabnorm]][i]
+  #id200new[k]=max(which(a320[[k]]$height>200))
+  #id20new[k]=max(which(a320[[k]]$height>20))
+  #throttle=rowMeans(a320[[k]][,73:76])
+  #airspd=rowMeans(a320[[k]][,42:43])
+  
+  #dat=cbind(a320[[k]][(id200new[k]+2):id20new[k],colind1],throttle[(id200new[k]+2):id20new[k]],airspd[(id200new[k]+2):id20new[k]],a320[[k]][(id200new[k]+1):(id20new[k]-1),colind1[c(-3,-9,-11)]],throttle[(id200new[k]+1):(id20new[k]-1)],airspd[(id200new[k]+1):(id20new[k]-1)],a320[[k]][id200new[k]:(id20new[k]-2),colind1[c(1,4,5,7,10)]],airspd[id200new[k]:(id20new[k]-2)],rep(i,id20new[k]-id200new[k]-1))
+  dat=cbind(a320[[k]][(id200new[k]+2):id20new[k],colind1],a320[[k]][(id200new[k]+1):(id20new[k]-1),colind1[c(-3,-9,-11)]],a320[[k]][id200new[k]:(id20new[k]-2),colind1[c(1,4,5,7,10)]],rep(i,id20new[k]-id200new[k]-1))
+  colnames(dat)=colnames(rawdata)
+  rawdata=rbind(rawdata,dat)
+}
+rawdata=rawdata[-1,]
+
+rawdata2=rawdata
+rawdata2$vy=rawdata2$vy/60  #vy单位改为ft/s
+rawdata2$vy1=rawdata2$vy1/60
+rawdata2$deltavy=rawdata2$vy-rawdata2$vy1
+#pitch单位扩大10^2
+ rawdata2$pitch=rawdata$pitch*100
+ rawdata2$pitch1=rawdata$pitch1*100
+ rawdata2$pitch2=rawdata$pitch2*100
+#俯仰角单位由度变成rad
+rawdata2$pitch=rawdata2$pitch*pi/180
+rawdata2$pitch1=rawdata2$pitch1*pi/180
+rawdata2$pitch2=rawdata2$pitch2*pi/180
+#速度与水平夹角(用竖直速度和空速算，没有用)
+rawdata2$beta=rawdata2$vy/rawdata2$airspd/6076.1154856*60*60
+rawdata2$beta1=rawdata2$vy1/rawdata2$airspd1/6076.1154856*60*60
+rawdata2$beta2=rawdata2$vy2/rawdata2$airspd2/6076.1154856*60*60
+#迎角计算(俯仰角+速度与水平夹角？没有用)
+rawdata2$attack=rawdata2$pitch+rawdata2$beta
+rawdata2$attack1=rawdata2$pitch1+rawdata2$beta1
+rawdata2$attack2=rawdata2$pitch2+rawdata2$beta2
+#升力竖直分量,没有用
+rawdata2$lift=(rawdata2$airspd*6076.1154856/60/60)^2/rawdata2$weight*rawdata2$attack
+rawdata2$lift1=(rawdata2$airspd1*6076.1154856/60/60)^2/rawdata2$weight1*rawdata2$attack1
+rawdata2$lift2=(rawdata2$airspd2*6076.1154856/60/60)^2/rawdata2$weight2*rawdata2$attack2
+#算两秒deltapitch平均作为控制量
+#俯仰角变化量
+rawdata2$deltapitch=rawdata2$pitch-rawdata2$pitch1
+rawdata2$deltapitch1=rawdata2$pitch1-rawdata2$pitch2
+rawdata2$deltapitch2=(rawdata2$pitch-rawdata2$pitch2)/2
+#用vx近似计算lift影响,用这个
+rawdata2$forcexy=(rawdata2$vx1*6076.1154856/60/60)/rawdata2$weight1*rawdata2$vy1*100  #乘100是因为pitch rescale
+rawdata2$forcep=(rawdata2$vx1*6076.1154856/60/60)^2/rawdata2$weight1*rawdata2$deltapitch2
+#提取顺/逆风大小
+rawdata2$vshun=rawdata2$vpara
+rawdata2$vshun[(rawdata2$vpara)<0]=0
+rawdata2$vni=rawdata2$vpara
+rawdata2$vni[(rawdata2$vpara)>0]=0
+#提取风和前2秒方向变化,低空风切变标准:平行风与前2s变化是否超过5节(海里/h),美国中度以上标准是2.6m/s
+rawdata2$deltawind=rawdata2$vpara-rawdata2$vpara2
+rawdata2$deltawind[which(rawdata2$deltawind<=5 & rawdata2$deltawind>=(-5))]=0
+rawdata2$deltawind[which(rawdata2$deltawind>5)]=1
+rawdata2$deltawind[which(rawdata2$deltawind<(-5))]=-1
+rawdata2$deltawind=as.factor(rawdata2$deltawind)
+#1为变得更顺风,-1为变得更逆风,0变化不大
+
+
+#各变量间散点图
+pairs(~deltavy+vwind+airforce+airforce1+attack+attack1+pitch+pitch1+lift+lift1+tui+tui1,data=rawdata1[sample(nrow(rawdata1),10000),])
+
+##拟合动力学方程(不考虑推力)
+library(car)
+#预回归,拟合找异常值
+# fitw2=lm(deltavy~vshun+vni+deltawind+vy1+pitch+deltapitch2+forcexy+forcep,data=rawdata2)
+# summary(fitw2)
+fitw2=lm(deltavy~vshun+vni+deltawind+vy1+pitch+deltapitch2+forcexy+forcep-1,data=rawdata2)
+summary(fitw2)
+#weigh=1/abs(1-coefficients(fitw)[6]*rawdata1$airspd1*6076.1154856/60/rawdata1$weight1)
+
+#去掉outlier后的回归
+qup=quantile(fitw2$residuals,probs=0.975)
+qlow=quantile(fitw2$residuals,probs=0.025)
+out=c(which(fitw2$residuals>qup),which(fitw2$residuals<qlow))
+infp=which(cooks.distance(fitw2)>4/(nrow(rawdata2)-8-1))
+#去掉outlier之后的6变量线性回归
+fitw.rem2=lm(deltavy~vshun+vni+deltawind+vy1+pitch+deltapitch2+forcexy+forcep-1,data=rawdata2[-union(out,infp),])
+summary(fitw.rem2)
+plot(fitw.rem2)
+
+##lme模型(不考虑推力,两阶段回归,没有用)
+library(lme4)
+fitm2=lmer(deltavy~vy1+pitch+deltapitch2+forcexy+forcep-1+(1|vpara),data=rawdata2[-union(out,infp)])
+summary(fitm2)
+plot(fitm2)
+#诊断qqplot
+qqnorm(y=resid(fitm2))
+qqline(y=resid(fitm2))
+
+#控制量deltapitch2和pitch的残差估计
+fitu=lm(rawdata2$deltapitch~rawdata2$deltapitch2-1)
+summary(fitu)
+
+#计算NRMSE,CV(RMSE)
+summary(fitw.rem2)$`sigma`/(max(fitw.rem2$model$deltavy)-min(fitw.rem2$model$deltavy))
+summary(fitw.rem2)$`sigma`/mean(abs(fitw.rem2$model$deltavy))
+```
+
+```{r}
+
+plot(x=-dat$height,y=dat$Computed.airspeed.CAPT_1,col=1,type="b",ylim=c(120,140))
+samp=sample(1:3034,5,replace=F)
+for(j in 1:5){
+  i=samp[j]
+  k=valid[c(1:3299)[-idabnorm]][i]
+  dat=a320[[k]][id200new[k]:id20new[k],]
+  lines(x=-dat$height,y=dat$Computed.airspeed.CAPT_1,col=j)
+}
+
+plot(x=-dat$height,y=dat$GPS.GROUND.SPEED.CAPT,col=1,type="b",ylim=c(120,140))
+samp=sample(1:3034,5,replace=F)
+for(j in 1:5){
+  i=samp[j]
+  k=valid[c(1:3299)[-idabnorm]][i]
+  dat=a320[[k]][id200new[k]:id20new[k],]
+  lines(x=-dat$height,y=dat$GPS.GROUND.SPEED.CAPT,col=j)
+}
+```
+
+
+##2.risk-sensitive LQR(没有用)
+```{r}
+colind1=c(1,41,64,65,70,38,68,69,71,82,81)
+colnam=c("vy","vx","h","pitch","roll","vwind","vpara","vvert","dist","weight","t")
+##数据预处理提取X,u,A,B
+datproc=function(i){ #i in 1:3034
+  k=valid[c(1:3299)[-idabnorm]][i]
+  dat=cbind(a320[[k]][(id200new[k]+2):id20new[k],colind1],a320[[k]][(id200new[k]+1):(id20new[k]-1),colind1[c(-3,-9,-11)]],a320[[k]][id200new[k]:(id20new[k]-2),colind1[c(1,4,5,7,10)]],rep(i,id20new[k]-id200new[k]-1))
+  colnames(dat)=c(colnam,paste(colnam[c(-3,-9,-11)],rep(1,8),sep=""),paste(colnam[c(1,4,5,7,10)],rep(2,5),sep=""))
+  
+  dat$vy=dat$vy/60  #vy单位改为ft/s
+  dat$vy1=dat$vy1/60
+  dat$deltavy=dat$vy-dat$vy1
+  #pitch单位扩大10^2
+  dat$pitch=dat$pitch*100
+  dat$pitch1=dat$pitch1*100
+  dat$pitch2=dat$pitch2*100
+  #俯仰角单位由度变成rad
+  dat$pitch=dat$pitch*pi/180
+  dat$pitch1=dat$pitch1*pi/180
+  dat$pitch2=dat$pitch2*pi/180
+  #算两秒deltapitch平均作为控制量
+  #俯仰角变化量
+  dat$deltapitch=dat$pitch-dat$pitch1
+  dat$deltapitch1=dat$pitch1-dat$pitch2
+  dat$deltapitch2=(dat$pitch-dat$pitch2)/2
+  #vx单位由nm/h改为ft/s
+  dat$vx1=dat$vx1*6076.1154856/60/60
+  dat$vx=dat$vx*6076.1154856/60/60
+  #用vx近似计算lift影响,用这个
+  dat$forcexy=(dat$vx1*6076.1154856/60/60)/dat$weight1*dat$vy1*100  #乘100是因为pitch rescale
+  dat$forcep=(dat$vx1*6076.1154856/60/60)^2/dat$weight1*dat$deltapitch2
+  #提取顺/逆风大小
+  dat$vshun=dat$vpara
+  dat$vshun[(dat$vpara)<0]=0
+  dat$vni=dat$vpara
+  dat$vni[(dat$vpara)>0]=0
+  #提取风和前2秒方向变化
+  dat$deltawind=dat$vpara-dat$vpara2
+  dat$deltawind[which(dat$deltawind<=5 & dat$deltawind>=(-5))]=0
+  dat$deltawind[which(dat$deltawind>5)]=1
+  dat$deltawind[which(dat$deltawind<(-5))]=-1
+  dat$deltawind=as.factor(dat$deltawind)
+  #1为变得更顺风,-1为变得更逆风,0变化不大
+  
+  #X序列
+  X=rbind(dat$vy1,dat$pitch)
+  u=dat$deltapitch2
+  b=summary(fitw.rem2)$`coefficients`[8,1]+summary(fitw.rem2)$`coefficients`[10,1]*dat$vx1^2/dat$weight1
+  B=rbind(b,rep(1,nrow(dat)))
+  C=rbind(summary(fitw.rem2)$`coefficients`[1,1]*dat$vshun+summary(fitw.rem2)$`coefficients`[2,1]*dat$vni+summary(fitw.rem2)$`coefficients`[2+as.numeric(dat$deltawind),1],0)
+  var1=summary(fitw.rem2)$`sigma`^2
+  var2=summary(fitu)$`sigma`^2
+  A=list()
+  Sigma=list()
+  for(i in 1:nrow(dat)){
+    a1=summary(fitw.rem2)$`coefficients`[6,1]+summary(fitw.rem2)$`coefficients`[9,1]*dat$vx1[i]/dat$weight1[i]*100
+    a2=summary(fitw.rem2)$`coefficients`[7,1]
+    A[[i]]=matrix(c(a1,0,a2,0),nrow=2)+diag(1,nrow=2)  #y从deltavy变为vy_t+1
+    
+    Sigma[[i]]=diag(x=c(var1,var2),nrow=2)
+  }
+  lens=nrow(dat)
+  
+  return(list(X,u,A,B,C,Sigma,lens))
+}
+
+##给定sigma,r求解风险敏感的LQR
+solver=function(sigma,r,x0,xhat,lens){
+  w=list()
+  w[[lens]]=matrix(c(1,0,0,0),nrow=2,ncol=2)
+  s=solve(solve(Sigma[[lens-1]])-sigma*w[[lens]])
+  S=list()
+  S[[lens]]=s
+  wbar=list()
+  wbar[[lens]]=w[[lens]]+sigma*w[[lens]]%*%s%*%w[[lens]]
+  a=list()
+  a[[lens]]=-xhat[,lens]
+  uopt=numeric()
+  xk=data.frame(rep(NA,2))
+  xk[,1]=x0
+  pseq=numeric()
+  
+  sig1 = 0.4136
+  sig2 = 0.4227
+  #sigwind=sqrt(unlist(Sigma)[seq(from=1,to=lens*4,by=4)]-0.304026)
+  for(i in (lens-1):2){
+    p=as.numeric(1/(r+t(B[,i])%*%wbar[[i+1]]%*%B[,i]))
+    w[[i]]=matrix(c(1,0,0,0),nrow=2,ncol=2)+
+      t(A[[i]])%*%(wbar[[i+1]]-p*wbar[[i+1]]%*%B[,i]%*%t(B[,i])%*%wbar[[i+1]])%*%A[[i]]
+    
+    s=solve(solve(Sigma[[i-1]])-sigma*w[[i]])
+    S[[i]]=s
+    wbar[[i]]=w[[i]]+sigma*w[[i]]%*%s%*%w[[i]]
+    
+    a[[i]]=-xhat[,i]+t(A[[i]])%*%wbar[[i+1]]%*%C[,i]+t(A[[i]])%*%(diag(1,nrow=2)-p*wbar[[i+1]]%*%B[,i]%*%t(B[,i]))%*%
+      (diag(1,nrow=2)+sigma*w[[i+1]]%*%s)%*%a[[i+1]]
+    pseq=c(pseq,p)
+  }
+  
+  for(i in 1:(lens-1)){
+    p=1/(r+t(B[,i])%*%wbar[[i+1]]%*%B[,i])
+    s=solve(solve(Sigma[[i]])-sigma*w[[i+1]])
+    uopt[i]=-p*t(B[,i])%*%(wbar[[i+1]]%*%(A[[i]]%*%xk[,i]+C[,i])+
+                             (diag(1,nrow=2)+sigma*w[[i+1]]%*%s)%*%a[[i+1]])
+    xk[,i+1]=A[[i]]%*%xk[,i]+B[,i]*uopt[i]+C[,i]+
+      c(rnorm(n=1,mean=0,sd=sig1),rnorm(n=1,mean=0,sd=sig2))
+    #风的随机效应,系数是随机变量,sd=0.03192,再乘以观测到的外生的风,sd=sigwind[i],sig1,sig2分别是两个拟合的残差sd
+  }
+  uopt[lens]=0
+  
+  return(list(xk,uopt,S,pseq))
+}
+
+
+
+#每步以当前状态为起始点考虑LQR决定当前控制u(没有用)
+# solveriter=function(sigma,r,xhat,lens){
+#   w=list()
+#   w[[lens]]=matrix(c(1,0,0,0),nrow=2,ncol=2)
+#   s=solve(solve(Sigma[[lens-1]])-sigma*w[[lens]])
+#   S=list()
+#   S[[lens]]=s
+#   wbar=list()
+#   wbar[[lens]]=w[[lens]]+sigma*w[[lens]]%*%s%*%w[[lens]]
+#   a=list()
+#   a[[lens]]=-xhat[,lens]
+#   uopt=numeric()
+#   xk=data.frame(rep(NA,2))
+#   xk[,1]=x0
+#   pseq=numeric()
+#   
+#   sig1 = 0.55139
+#   sig2 = 0.4227
+#   sigwind=sqrt(unlist(Sigma)[seq(from=1,to=lens*4,by=4)]-0.304026)
+#   for(i in (lens-1):2){
+#     p=as.numeric(1/(r+t(B[,i])%*%wbar[[i+1]]%*%B[,i]))
+#     w[[i]]=matrix(c(1,0,0,0),nrow=2,ncol=2)+
+#       t(A[[i]])%*%(wbar[[i+1]]-p*wbar[[i+1]]%*%B[,i]%*%t(B[,i])%*%wbar[[i+1]])%*%A[[i]]
+#     
+#     s=solve(solve(Sigma[[i-1]])-sigma*w[[i]])
+#     S[[i]]=s
+#     wbar[[i]]=w[[i]]+sigma*w[[i]]%*%s%*%w[[i]]
+#     
+#     a[[i]]=-xhat[,i]+t(A[[i]])%*%(diag(1,nrow=2)-p*wbar[[i+1]]%*%B[,i]%*%t(B[,i]))%*%
+#       (diag(1,nrow=2)+sigma*w[[i+1]]%*%s)%*%a[[i+1]]
+#     pseq=c(pseq,p)
+#   }
+#   
+#   for(i in 1:(lens-1)){
+#     p=1/(r+t(B[,i])%*%wbar[[i+1]]%*%B[,i])
+#     s=solve(solve(Sigma[[i]])-sigma*w[[i+1]])
+#     uopt[i]=-p*t(B[,i])%*%(wbar[[i+1]]%*%A[[i]]%*%X[,i]+
+#                              (diag(1,nrow=2)+sigma*w[[i+1]]%*%s)%*%a[[i+1]])
+#     #uopt[i]=-p*t(B[,i])%*%wbar[[i+1]]%*%A[[i]]%*%X[,i]
+#     #xk[,i+1]=A[[i]]%*%X[,i]+B[,i]*uopt[i]
+#     #+c(rnorm(n=1,mean=0,sd=sig1)+rnorm(n=1,mean=0,sd=sigwind[i]),rnorm(n=1,mean=0,sd=sig2))
+#     #风的随机效应,系数是随机变量,sd=0.03192,再乘以观测到的外生的风,sd=sigwind[i],sig1,sig2分别是两个拟合的残差sd
+#   }
+#   uopt[lens]=0
+#   
+#   return(list(uopt,S,pseq))
+# }
+
+
+
+#验证风险敏感的LQR解是否是最优解
+id=1314
+X=datproc(id)[[1]]
+u=datproc(id)[[2]]
+A=datproc(id)[[3]]
+B=datproc(id)[[4]]
+C=datproc(id)[[5]]
+Sigma=datproc(id)[[6]]
+lens=datproc(id)[[7]]
+x0=X[,1]
+lens
+X
+u
+xhat=rbind(c(-12.5,-12.5,-12.5,-12.5,-12.5,-12,-12,-12,-11.8,-11.8,-11,-11,-10.5,-10.5,-9,-7),0)
+#xhat=rbind(c(-14,-13.6,-13.6,-13,-13,-13,-12.8,-12.8,-12.6,-12,-11.6,-11.6,-10),0)
+
+sigma=1
+r=2
+solution=solver(sigma,r,x0,xhat,lens)
+xopt=solution[[1]]
+uopt=solution[[2]]
+S=solution[[3]]
+pseq=solution[[4]]
+for(i in 2:lens){
+  print(eigen(S[[i]])$`values`)
+}
+pseq
+uopt1=uopt
+xk1=xk
+i=lens-1
+uopt1[i]
+uopt1[i]=0
+xk1[,i+1]=A[[i]]%*%xk1[,i]+B[,i]*uopt1[i]+C[,i]
+loss=sigma*exp(sigma*(xk[1,lens]-xhat[1,lens])^2/2)*exp(sigma*r*uopt[lens-1]^2/2) 
+loss1=sigma*exp(sigma*(xk1[1,lens]-xhat[1,lens])^2/2)*exp(sigma*r*uopt1[lens-1]^2/2) 
+c(loss,loss1)
+xopt
+uopt
+
+# #实际观测序列X下的最优控制（其实只有最后一步u有可比性）
+# sigma=-1
+# r=5
+# uopt=solveriter(sigma,r,xhat,lens)[[1]][lens-1]
+# solveriter(sigma,r,xhat,lens)[[2]]
+# solveriter(sigma,r,xhat,lens)[[3]]
+# i=lens-1
+# xend=A[[i]]%*%X[,i]+B[,i]*uopt
+# loss=sigma*exp(sigma*(xend[1]-xhat[1,lens])^2/2)*exp(sigma*r*uopt^2/2) 
+# uopt1=1.0738
+# c(uopt,uopt1)
+# xend1=A[[i]]%*%X[,i]+B[,i]*uopt1
+# c(xend[1],xend1[1],xhat[1,lens])
+# loss1=sigma*exp(sigma*(xend1[1]-xhat[1,lens])^2/2)*exp(sigma*r*uopt1^2/2)
+# c(loss,loss1)
+
+
+
+
+# #检验实际序列是否符合dynamic model
+# id=1102
+# X=datproc(id)[1][[1]]
+# u=datproc(id)[2][[1]]
+# A=datproc(id)[3][[1]]
+# B=datproc(id)[4][[1]]
+# Sigma=datproc(id)[5][[1]]
+# lens=datproc(id)[6][[1]]
+# xk2=data.frame(X[,1])
+# err=data.frame(rep(NA,2))
+# 
+# sig1 = 0.55139
+# sig2 = 0.4227
+# sigwind=sqrt(unlist(Sigma)[seq(from=1,to=lens*4,by=4)]-0.304026)
+# for(i in 1:(lens-1)){
+#   xk2[,i+1]=A[[i]]%*%xk2[,i]+B[,i]*u[i]
+#   err[,i]=c(rnorm(n=1,mean=0,sd=sig1)+rnorm(n=1,mean=0,sd=sigwind[i]),rnorm(n=1,mean=0,sd=sig2))
+# }
+# xk2-X
+# err
+
+
+##学习飞行员sigma,r
+#目标函数
+cfunc=function(sigma,r,xk,uk,xhat){
+  cost=r*sum(uk^2)+sum((xk[1,]-xhat[1,])^2)
+  if(sigma!=0){
+    return(exp(sigma*cost/2))
+  }else{
+    return(cost/2)
+  }
+}
+  
+expcfunc=function(sigma,r,x0,xhat,lens){
+  los=numeric()
+  for(i in 1:200){
+    sol=solver(sigma,r,x0,xhat,lens)
+    xk=sol[[1]]
+    uk=sol[[2]]
+    pseq=sol[[4]]
+    if(length(which(pseq>0))==(lens-2)){  #如果最优解大前提满足
+      los[i]=cfunc(sigma,r,xk,uk,xhat)
+    }
+  }
+  if(sigma!=0){
+     return(log(mean(los))/sigma)
+   }else{
+     return(mean(los))
+   }
+}
+#如果只学习实际的vy轨迹偏离,不惩罚控制u
+cfunc1=function(sigma,r,xk,uk,xhat){
+  cost=sum((xk[1,]-xhat[1,])^2)
+  if(sigma!=0){
+    return(exp(sigma*cost/2))
+  }else{
+    return(cost/2)
+  }
+}
+  
+expcfunc1=function(sigma,r,x0,xhat,lens){
+  los=numeric()
+  for(i in 1:200){
+    sol=solver(sigma,r,x0,xhat,lens)
+    xk=sol[[1]]
+    uk=sol[[2]]
+    pseq=sol[[4]]
+    if(length(which(pseq>0))==(lens-2)){  #如果最优解大前提满足
+      los[i]=cfunc1(sigma,r,xk,uk,xhat)
+    }
+  }
+  if(sigma!=0){
+     return(log(mean(los,na.rm=TRUE))/sigma)
+   }else{
+     return(mean(los,na.rm=TRUE))
+   }
+}
+
+
+#学习飞行员的sigma,r
+id=1102
+X=datproc(id)[[1]]
+u=datproc(id)[[2]]
+A=datproc(id)[[3]]
+B=datproc(id)[[4]]
+C=datproc(id)[[5]]
+Sigma=datproc(id)[[6]]
+lens=datproc(id)[[7]]
+x0=X[,1]
+lens
+X
+u
+xhat=rbind(c(-12.5,-12.5,-11.6,-11.6,-11.6,-11.6,-11.4,-11.2,-11.2,-10.8,-10.4,-10.2,-10.2,-10.2),0)
+
+risklqr=function(X,u,xhat,lens){
+  x0=X[,1]
+  optsig=0
+  optr=0
+  rells=10^6
+  for(sigi in seq(-10,-1,length.out=10)){
+    for(ri in seq(0.1,5,length.out=10)){
+      simlsi=expcfunc1(sigi,ri,x0,xhat,lens)
+      if(sigi!=0){
+        lossi=abs(simlsi/(log(cfunc1(sigi,ri,X,u,xhat))/sigi)-1)
+      }else{
+        lossi=abs(simlsi/cfunc1(sigi,ri,X,u,xhat)-1)
+      }
+      
+      if(is.na(lossi)==FALSE){
+        if(lossi<rells){
+          optsig=sigi
+          optr=ri
+          rells=lossi
+          optsimls=simlsi
+          optactls=log(cfunc1(sigi,ri,X,u,xhat))/sigi
+        }else{
+          next
+        }
+      }
+    }
+  }
+  return(list(optsig,optr,rells,optsimls,optactls))
+}
+optsol=risklqr(X,u,xhat,lens)
+optsig=optsol[[1]]
+optr=optsol[[2]]
+simls=optsol[[4]]
+actls=optsol[[5]]
+solution=solver(optsig,optr,x0,xhat,lens)
+xopt=solution[[1]]
+uopt=solution[[2]]
+S=solution[[3]]
+pseq=solution[[4]]
+# optsol1=risklqr(X,u,xhat,lens)
+# optsig1=optsol1[[1]]
+# optr1=optsol1[[2]]
+# simls1=optsol1[[4]]
+# actls1=optsol1[[5]]
+# solver(optsig,optr,x0,xhat,lens)
+
+#sigma,r学习效果检验
+#vy
+uopt=list()
+xopt=data.frame(rep(NA,lens))
+plot(x=1:lens,y=-X[1,],type="l",col=1,ylim=c(6,13.5),lwd=2)
+lines(x=1:lens,y=-xhat[1,],col="red",lwd=2)
+for(i in 1:5){
+  solution=solver(optsig,optr,x0,xhat,lens)
+  xopt[,i]=t(solution[[1]][1,])
+  uopt[[i]]=solution[[2]]
+  lines(x=1:lens,y=-xopt[,i],col=i)
+}
+lines(x=1:lens,y=-rowMeans(xopt),col="blue",lwd=2)
+
+#control
+plot(x=1:lens,y=u,type="l",col=1,lwd=2)
+for(i in 1:5){
+  lines(x=1:lens,y=uopt[[i]],col=i)
+}
+
+
+
+```
+
+
+##2.没有xhat的risk-sensitive LQR
+```{r}
+colind1=c(1,41,64,65,70,38,68,69,71,82,81)
+colnam=c("vy","vx","h","pitch","roll","vwind","vpara","vvert","dist","weight","t")
+##数据预处理提取X,u,A,B
+datproc=function(i){ #i in 1:3034
+  k=valid[c(1:3299)[-idabnorm]][i]
+  dat=cbind(a320[[k]][(id200new[k]+2):id20new[k],colind1],a320[[k]][(id200new[k]+1):(id20new[k]-1),colind1[c(-3,-9,-11)]],a320[[k]][id200new[k]:(id20new[k]-2),colind1[c(1,4,5,7,10)]],rep(i,id20new[k]-id200new[k]-1))
+  colnames(dat)=c(colnam,paste(colnam[c(-3,-9,-11)],rep(1,8),sep=""),paste(colnam[c(1,4,5,7,10)],rep(2,5),sep=""))
+  
+  dat$vy=dat$vy/60  #vy单位改为ft/s
+  dat$vy1=dat$vy1/60
+  dat$deltavy=dat$vy-dat$vy1
+  #pitch单位扩大10^2
+  dat$pitch=dat$pitch*100
+  dat$pitch1=dat$pitch1*100
+  dat$pitch2=dat$pitch2*100
+  #俯仰角单位由度变成rad
+  dat$pitch=dat$pitch*pi/180
+  dat$pitch1=dat$pitch1*pi/180
+  dat$pitch2=dat$pitch2*pi/180
+  #算两秒deltapitch平均作为控制量
+  #俯仰角变化量
+  dat$deltapitch=dat$pitch-dat$pitch1
+  dat$deltapitch1=dat$pitch1-dat$pitch2
+  dat$deltapitch2=(dat$pitch-dat$pitch2)/2
+  #vx单位由nm/h改为ft/s
+  dat$vx1=dat$vx1*6076.1154856/60/60
+  dat$vx=dat$vx*6076.1154856/60/60
+  #用vx近似计算lift影响,用这个
+  dat$forcexy=(dat$vx1*6076.1154856/60/60)/dat$weight1*dat$vy1*100  #乘100是因为pitch rescale
+  dat$forcep=(dat$vx1*6076.1154856/60/60)^2/dat$weight1*dat$deltapitch2
+  #提取顺/逆风大小
+  dat$vshun=dat$vpara
+  dat$vshun[(dat$vpara)<0]=0
+  dat$vni=dat$vpara
+  dat$vni[(dat$vpara)>0]=0
+  #提取风和前2秒方向变化
+  dat$deltawind=dat$vpara-dat$vpara2
+  dat$deltawind[which(dat$deltawind<=5 & dat$deltawind>=(-5))]=0
+  dat$deltawind[which(dat$deltawind>5)]=1
+  dat$deltawind[which(dat$deltawind<(-5))]=-1
+  dat$deltawind=as.factor(dat$deltawind)
+  #1为变得更顺风,-1为变得更逆风,0变化不大
+  
+  #X序列(变量scale缩小/10,协方差矩阵/100,系数不变)
+  X=rbind(dat$vy1,dat$pitch)/10
+  u=dat$deltapitch2/10
+  b=summary(fitw.rem2)$`coefficients`[8,1]+summary(fitw.rem2)$`coefficients`[10,1]*dat$vx1^2/dat$weight1
+  B=rbind(b,rep(1,nrow(dat)))
+  C=rbind(summary(fitw.rem2)$`coefficients`[1,1]*dat$vshun+summary(fitw.rem2)$`coefficients`[2,1]*dat$vni+summary(fitw.rem2)$`coefficients`[2+as.numeric(dat$deltawind),1],0)/10
+  var1=summary(fitw.rem2)$`sigma`^2
+  var2=summary(fitu)$`sigma`^2
+  A=list()
+  Sigma=list()
+  for(i in 1:nrow(dat)){
+    a1=summary(fitw.rem2)$`coefficients`[6,1]+summary(fitw.rem2)$`coefficients`[9,1]*dat$vx1[i]/dat$weight1[i]*100  #这里是跟着上面datscale带来的,不动
+    a2=summary(fitw.rem2)$`coefficients`[7,1]
+    A[[i]]=matrix(c(a1,0,a2,0),nrow=2)+diag(1,nrow=2)  #y从deltavy变为vy_t+1
+    
+    Sigma[[i]]=diag(x=c(var1,var2),nrow=2)/100
+  }
+  lens=nrow(dat)
+  
+  return(list(X,u,A,B,C,Sigma,lens))
+}
+
+##给定sigma,r求解风险敏感的LQR
+solver=function(sigma,r,paralam,x0,lens){
+  q=list()
+  q[[lens-1]]=matrix(c(1,0,0,0),nrow=2,ncol=2)
+  w=list()
+  w[[lens]]=paralam*matrix(c(1,0,0,0),nrow=2,ncol=2)  #最终20ft时与标准vy的偏差加权重
+  s=solve(solve(Sigma[[lens-1]])-sigma*w[[lens]]-sigma*q[[lens-1]])
+  S=list()
+  S[[lens-1]]=s
+  wbar=list()
+  wbar[[lens]]=w[[lens]]+sigma*w[[lens]]%*%s%*%w[[lens]]
+  qbar=list()
+  qbar[[lens-1]]=q[[lens-1]]+sigma*q[[lens-1]]%*%s%*%q[[lens-1]]
+  what=list()
+  what[[lens]]=wbar[[lens]]+sigma*q[[lens-1]]%*%S[[lens-1]]%*%w[[lens]]
+  qhat=list()
+  qhat[[lens-1]]=qbar[[lens-1]]+sigma*w[[lens]]%*%S[[lens-1]]%*%q[[lens-1]]
+  
+  a=list()
+  a[[lens]]=-paralam*matrix(c(1,0,0,0),nrow=2,ncol=2)%*%c(-0.633,0)#设定20ft时对应xhat/10=0.17m/s~0.216m/s=取均值1.93m/s=0.633ft/s
+            #最终20ft时与标准vy的偏差加权重
+  uopt=numeric()
+  xk=data.frame(rep(NA,2))
+  xk[,1]=x0
+  pseq=numeric()
+  
+  sig1 = 0.4136/10  #标准差随scale缩小/10
+  sig2 = 0.4227/10
+  #sigwind=sqrt(unlist(Sigma)[seq(from=1,to=lens*4,by=4)]-0.304026)
+  for(i in (lens-1):2){
+    p=as.numeric(1/(r+t(B[,i])%*%(wbar[[i+1]]+qbar[[i]])%*%B[,i]+
+                      2*sigma*t(B[,i])%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%B[,i]))
+    AI=A[[i]]-diag(1,nrow=2)
+    mtemp=qhat[[i]]%*%AI+what[[i+1]]%*%A[[i]]
+    w[[i]]=-p*t(mtemp)%*%B[,i]%*%t(B[,i])%*%(mtemp)+
+      t(AI)%*%qbar[[i]]%*%AI+t(A[[i]])%*%wbar[[i+1]]%*%A[[i]]+
+      sigma*t(AI)%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%A[[i]]+
+      sigma*t(t(AI)%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%A[[i]])
+    w[[i]][2:3]=0  #手动清除矩阵计算误差带来的反对角非0
+    
+    q[[i-1]]=matrix(c(1,0,0,0),nrow=2,ncol=2)
+    s=solve(solve(Sigma[[i-1]])-sigma*w[[i]]-sigma*q[[i-1]])
+    S[[i-1]]=s
+    wbar[[i]]=w[[i]]+sigma*w[[i]]%*%s%*%w[[i]]
+    qbar[[i-1]]=q[[i-1]]+sigma*q[[i-1]]%*%s%*%q[[i-1]]
+    what[[i]]=wbar[[i]]+sigma*q[[i-1]]%*%S[[i-1]]%*%w[[i]]
+    qhat[[i-1]]=qbar[[i-1]]+sigma*w[[i]]%*%S[[i-1]]%*%q[[i-1]]
+    
+    
+    a[[i]]=-p*t(qhat[[i]]%*%AI+what[[i+1]]%*%A[[i]])%*%B[,i]%*%t(B[,i])%*%((qhat[[i]]+what[[i+1]])%*%C[,i]+(diag(1,nrow=2)+sigma*(w[[i+1]]+q[[i]])%*%S[[i]])%*%a[[i+1]])+
+      t(AI)%*%qbar[[i]]%*%C[,i]+t(A[[i]])%*%wbar[[i+1]]%*%C[,i]+t(A[[i]])%*%a[[i+1]]+
+      sigma*t(q[[i]]%*%AI+w[[i+1]]%*%A[[i]])%*%S[[i]]%*%a[[i+1]]+
+      sigma*t(A[[i]])%*%w[[i+1]]%*%S[[i]]%*%q[[i]]%*%C[,i]+
+      sigma*t(AI)%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%C[,i]
+    pseq=c(pseq,p)
+  }
+  
+  for(i in 1:(lens-1)){
+    p=as.numeric(1/(r+t(B[,i])%*%(wbar[[i+1]]+qbar[[i]])%*%B[,i]+
+                      2*sigma*t(B[,i])%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%B[,i]))
+    AI=A[[i]]-diag(1,nrow=2)
+    
+    uopt[i]=-p*t(B[,i])%*%(qhat[[i]]%*%(AI%*%xk[,i]+C[,i])+what[[i+1]]%*%(A[[i]]%*%xk[,i]+C[,i])+(diag(1,nrow=2)+sigma*(w[[i+1]]+q[[i]])%*%S[[i]])%*%a[[i+1]])
+    
+    xk[,i+1]=A[[i]]%*%xk[,i]+B[,i]*uopt[i]+C[,i]+
+      c(rnorm(n=1,mean=0,sd=sig1),rnorm(n=1,mean=0,sd=sig2))
+    #风的随机效应,系数是随机变量,sd=0.03192,再乘以观测到的外生的风,sd=sigwind[i],sig1,sig2分别是两个拟合的残差sd
+  }
+  uopt[lens]=0
+  
+  return(list(xk,uopt,S,pseq))
+}
+
+
+#验证风险敏感的LQR解是否是最优解
+id=1314
+X=datproc(id)[[1]]
+u=datproc(id)[[2]]
+A=datproc(id)[[3]]
+B=datproc(id)[[4]]
+C=datproc(id)[[5]]
+Sigma=datproc(id)[[6]]
+lens=datproc(id)[[7]]
+x0=X[,1]
+lens
+X
+u
+
+
+sigma=-10
+r=0
+paralam=50
+solution=solver(sigma,r,paralam,x0,lens)
+xopt=solution[[1]]
+uopt=solution[[2]]
+S=solution[[3]]
+pseq=solution[[4]]
+for(i in 1:(lens-1)){
+  print(eigen(S[[i]])$`values`)
+}
+pseq
+uopt1=uopt
+xk=xopt
+xk1=xopt
+i=lens-1
+uopt1[i]=0
+xk[,i+1]=A[[i]]%*%xk[,i]+B[,i]*uopt[i]+C[,i]
+xk1[,i+1]=A[[i]]%*%xk1[,i]+B[,i]*uopt1[i]+C[,i]
+loss=sigma*exp(sigma*(xk[1,lens]-xk[1,lens-1])^2/2)*exp(sigma*r*uopt[lens-1]^2/2)*
+  exp(sigma*paralam*(xk[1,lens]-(-5))^2/2)
+loss1=sigma*exp(sigma*(xk1[1,lens]-xk1[1,lens-1])^2/2)*exp(sigma*r*uopt1[lens-1]^2/2)*
+  exp(sigma*paralam*(xk1[1,lens]-(-5))^2/2)
+c(loss,loss1)
+xopt
+uopt
+sd(xopt[1,])
+mean(abs(uopt))
+
+#sigma对最优解的影响画图(没有用,用下面的)
+r=0
+paralam=1
+xopt=data.frame(rep(NA,lens))
+uopt=data.frame(rep(NA,lens))
+utemp=data.frame(rep(NA,lens))
+plot(x=1:lens,y=-X[1,],type="l",col=1,ylim=c(0.5,1.3),lwd=2,ylab="vy",main=paste("id:",id,", r=",paralam,sep=""))
+i=1
+sig=seq(-10,5,length.out=6)
+for(sigi in sig){
+  solution=solver(sigi,r,paralam,x0,lens)
+  pseq=solution[[4]]
+  if(length(which(pseq>0))==(lens-2)){
+    for(j in 1:100){
+      solution=solver(sigi,r,paralam,x0,lens)
+      xopt[,j]=t(solution[[1]][1,])
+      utemp[,j]=solution[[2]]
+    }
+    uopt[,i]=rowMeans(utemp)
+    lines(x=1:lens,y=-rowMeans(xopt),col=i)
+    text(x=5,y=1-i/10,labels=paste("sigma=",sigi),col=i)
+  }
+  i=i+1
+}
+abline(h=0.633,col="red",lwd=1)
+
+plot(x=1:lens,y=u,type="l",lwd=2,main=paste("id:",id,", r=",paralam,sep=""),ylim=c(-0.1,0.15))
+for(i in 1:6){
+  #solution=solver(sig[i],r,paralam,x0,lens)
+  #uopt[,i]=solution[[2]]
+  lines(x=1:lens,y=uopt[,i],col=i)
+  text(x=5,y=0.02-i/50,labels=paste("sigma=",sig[i]),col=i)
+}
+##paralam对最优解的影响画图
+r=0
+sigma=1
+xopt=data.frame(rep(NA,lens))
+plot(x=1:lens,y=-X[1,],type="l",col="grey",ylim=c(0.5,1.3),lwd=2,xlab="Time",ylab="State x",main=paste("id:",id,", sigma=",sigma,sep=""))
+text(x=13,y=1.1,labels=paste("observed states"),col="grey",font=1)
+i=1
+paralam=c(0,0.01,0.02,0.05,1)
+colseq=c("black","#8E388E","#D02090","red","#FFC125")
+for(lami in paralam){
+  solution=solver(sigma,r,lami,x0,lens)
+  pseq=solution[[4]]
+  if(length(which(pseq>0))==(lens-2)){
+    for(j in 1:50){
+      solution=solver(sigma,r,lami,x0,lens)
+      xopt[,j]=t(solution[[1]][1,])
+    }
+    lines(x=1:lens,y=-rowMeans(xopt),col=colseq[i],lwd=2)
+    text(x=4,y=1.07-i/10,labels=paste("r =",lami),col=colseq[i],font=1)
+  }
+  i=i+1
+}
+abline(h=0.633,col="red",lwd=1)
+
+#sigma对最优解影响验证,画图
+solversig=function(sigma,r,paralam,x0,lens){
+  q=list()
+  q[[lens-1]]=matrix(c(1,0,0,0),nrow=2,ncol=2)
+  w=list()
+  w[[lens]]=paralam*matrix(c(1,0,0,0),nrow=2,ncol=2)  #最终20ft时与标准vy的偏差加权重
+  s=solve(solve(Sigma[[lens-1]])-sigma*w[[lens]]-sigma*q[[lens-1]])
+  S=list()
+  S[[lens-1]]=s
+  wbar=list()
+  wbar[[lens]]=w[[lens]]+sigma*w[[lens]]%*%s%*%w[[lens]]
+  qbar=list()
+  qbar[[lens-1]]=q[[lens-1]]+sigma*q[[lens-1]]%*%s%*%q[[lens-1]]
+  what=list()
+  what[[lens]]=wbar[[lens]]+sigma*q[[lens-1]]%*%S[[lens-1]]%*%w[[lens]]
+  qhat=list()
+  qhat[[lens-1]]=qbar[[lens-1]]+sigma*w[[lens]]%*%S[[lens-1]]%*%q[[lens-1]]
+  
+  a=list()
+  a[[lens]]=-paralam*matrix(c(1,0,0,0),nrow=2,ncol=2)%*%c(-0.633,0)#设定20ft时对应xhat/10=0.5ft/s
+            #最终20ft时与标准vy的偏差加权重
+  uopt=numeric()
+  xk=x0
+  pseq=numeric()
+  
+  sig1 = 0.4136
+  sig2 = 0.4227
+  #sigwind=sqrt(unlist(Sigma)[seq(from=1,to=lens*4,by=4)]-0.304026)
+  for(i in (lens-1):2){
+    p=as.numeric(1/(r+t(B[,i])%*%(wbar[[i+1]]+qbar[[i]])%*%B[,i]+
+                      2*sigma*t(B[,i])%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%B[,i]))
+    AI=A[[i]]-diag(1,nrow=2)
+    mtemp=qhat[[i]]%*%AI+what[[i+1]]%*%A[[i]]
+    w[[i]]=-p*t(mtemp)%*%B[,i]%*%t(B[,i])%*%(mtemp)+
+      t(AI)%*%qbar[[i]]%*%AI+t(A[[i]])%*%wbar[[i+1]]%*%A[[i]]+
+      sigma*t(AI)%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%A[[i]]+
+      sigma*t(t(AI)%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%A[[i]])
+    w[[i]][2:3]=0  #手动清除矩阵计算误差带来的反对角非0
+    
+    
+    q[[i-1]]=matrix(c(1,0,0,0),nrow=2,ncol=2)
+    s=solve(solve(Sigma[[i-1]])-sigma*w[[i]]-sigma*q[[i-1]])
+    S[[i-1]]=s
+    wbar[[i]]=w[[i]]+sigma*w[[i]]%*%s%*%w[[i]]
+    qbar[[i-1]]=q[[i-1]]+sigma*q[[i-1]]%*%s%*%q[[i-1]]
+    what[[i]]=wbar[[i]]+sigma*q[[i-1]]%*%S[[i-1]]%*%w[[i]]
+    qhat[[i-1]]=qbar[[i-1]]+sigma*w[[i]]%*%S[[i-1]]%*%q[[i-1]]
+    
+    a[[i]]=-p*t(qhat[[i]]%*%AI+what[[i+1]]%*%A[[i]])%*%B[,i]%*%t(B[,i])%*%((qhat[[i]]+what[[i+1]])%*%C[,i]+(diag(1,nrow=2)+sigma*(w[[i+1]]+q[[i]])%*%S[[i]])%*%a[[i+1]])+
+      t(AI)%*%qbar[[i]]%*%C[,i]+t(A[[i]])%*%wbar[[i+1]]%*%C[,i]+t(A[[i]])%*%a[[i+1]]+
+      sigma*t(q[[i]]%*%AI+w[[i+1]]%*%A[[i]])%*%S[[i]]%*%a[[i+1]]+
+      sigma*t(A[[i]])%*%w[[i+1]]%*%S[[i]]%*%q[[i]]%*%C[,i]+
+      sigma*t(AI)%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%C[,i]
+    pseq=c(pseq,p)  #注意pseq的顺序是与index反的
+  }
+  
+  i=lens-1
+    p=as.numeric(1/(r+t(B[,i])%*%(wbar[[i+1]]+qbar[[i]])%*%B[,i]+
+                      2*sigma*t(B[,i])%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%B[,i]))
+    AI=A[[i]]-diag(1,nrow=2)
+    
+    uopt=-p*t(B[,i])%*%(qhat[[i]]%*%(AI%*%xk+C[,i])+what[[i+1]]%*%(A[[i]]%*%xk+C[,i])+(diag(1,nrow=2)+sigma*(w[[i+1]]+q[[i]])%*%S[[i]])%*%a[[i+1]])
+    
+    #xk[,i+1]=A[[i]]%*%xk[,i]+B[,i]*uopt[i]+C[,i]+
+      #c(rnorm(n=1,mean=0,sd=sig1),rnorm(n=1,mean=0,sd=sig2))
+    #风的随机效应,系数是随机变量,sd=0.03192,再乘以观测到的外生的风,sd=sigwind[i],sig1,sig2分别是两个拟合的残差sd
+  
+  return(list(uopt,S,pseq))
+}
+
+#画图,sigma正负/随机性lohi灵敏度分析(使用下面单独的solversig)
+paralam=1
+r=0
+ulopos=numeric()
+uhipos=numeric()
+uloneg=numeric()
+uhineg=numeric()
+xseq=seq(x0[1]-5,x0[1]+5,length.out=11)
+sigma=10^2
+for(i in 1:11){
+  solution=solversig(sigma,r,paralam,c(xseq[i],x0[2]),lens)
+  if(length(which(solution[[3]]>0))==(lens-2)){
+    ulopos[i]=solution[[1]]
+  }
+}
+sigma=-10^11
+for(i in 1:11){
+  solution=solversig(sigma,r,paralam,c(xseq[i],x0[2]),lens)
+  if(length(which(solution[[3]]>0))==(lens-2)){
+    uloneg[i]=solution[[1]]
+  }
+}
+for(i in 1:lens){
+  Sigma[[i]]=Sigma[[i]]*10^7
+}
+sigma=10^2
+for(i in 1:11){
+  solution=solversig(sigma,r,paralam,c(xseq[i],x0[2]),lens)
+  #if(length(which(solution[[3]]>0))==(lens-2)){
+    uhipos[i]=solution[[1]]
+  #}
+}
+sigma=-10^11
+for(i in 1:11){
+  solution=solversig(sigma,r,paralam,c(xseq[i],x0[2]),lens)
+  if(length(which(solution[[3]]>0))==(lens-2)){
+    uhineg[i]=solution[[1]]
+  }
+}
+ulopos-uhipos
+uloneg-uhineg
+
+plot(x=xseq,y=uloneg,xlab="State xt",ylab="Control ut",main="sigma<0, low VS high Noise Level",type="l",lwd=3,col="#D02090",ylim=c(-0.04,0.05))
+lines(x=xseq,y=uhineg,lwd=3,col="#FFC125")
+legend("top",legend=c("low noise level","high noise level"),ncol=2,cex=0.8,bty="n",col=c("#D02090","#FFC125"),lty=1,lwd=2)
+
+plot(x=xseq,y=ulopos,xlab="State xt",ylab="Control ut",main="sigma>0, low VS high Noise Level",type="l",lwd=3,col="#D02090",ylim=c(-0.04,0.05))
+lines(x=xseq,y=ulopos+(uhipos-ulopos)*10^8*5,lwd=3,col="#FFC125")
+legend("top",legend=c("low noise level","high noise level"),ncol=2,cex=0.8,bty="n",col=c("#D02090","#FFC125"),lty=1,lwd=2)
+
+plot(x=xseq,y=ulopos,xlab="State xt",ylab="Control ut",main="sigma=0, low VS high Noise Level",type="l",lwd=3,col="#D02090",ylim=c(-0.04,0.05),lty=2)
+lines(x=xseq[-1:-2],y=uhipos[-1:-2],lwd=3,col="#FFC125",lty=2)  #把pos里sigma=0
+legend("top",legend=c("low noise level","high noise level"),ncol=2,cex=0.8,bty="n",col=c("#D02090","#FFC125"),lty=1,lwd=2)
+
+##学习飞行员sigma,r
+#只学习实际的vy轨迹偏离,不惩罚控制u
+#目标函数
+cfunc=function(sigma,r,paralam,xk,uk){
+  cost=sum((xk[1,-1]-xk[1,-lens])^2)+paralam*(xk[1,lens]-(-0.633))^2  #最终20ft时与标准vy的偏差加权重
+  if(sigma!=0){
+    return(exp(sigma*cost/2))
+  }else{
+    return(cost/2)
+  }
+}
+  
+expcfunc=function(sigma,r,paralam,x0,lens){
+  los=numeric()
+  for(i in 1:200){
+    sol=solver(sigma,r,paralam,x0,lens)
+    xk=sol[[1]]
+    uk=sol[[2]]
+    pseq=sol[[4]]
+    if(length(which(pseq>0))==(lens-2)){  #如果最优解大前提满足
+      los[i]=cfunc(sigma,r,paralam,xk,uk)
+    }
+  }
+  if(sigma!=0){
+     return(log(mean(los,na.rm=TRUE))/sigma)
+   }else{
+     return(mean(los,na.rm=TRUE))
+   }
+}
+
+
+#学习飞行员的sigma,paralam
+id=1
+X=datproc(id)[[1]]
+u=datproc(id)[[2]]
+A=datproc(id)[[3]]
+B=datproc(id)[[4]]
+C=datproc(id)[[5]]
+Sigma=datproc(id)[[6]]
+lens=datproc(id)[[7]]
+x0=X[,1]
+lens
+X
+u
+xhat=rbind(c(-12.5,-12.5,-11.6,-11.6,-11.6,-11.6,-11.4,-11.2,-11.2,-10.8,-10.4,-10.2,-10.2,-10.2),0)
+
+
+r=0
+risklqr=function(X,u,lens,siginf,sigsup,laminf,lamsup){
+  x0=X[,1]
+  optsig=0
+  optr=0
+  rells=10^6
+  for(sigi in seq(siginf,sigsup,length.out=10)){
+    for(lami in seq(laminf,lamsup,length.out=10)){
+      simlsi=expcfunc(sigi,r,lami,x0,lens)
+      if(sigi!=0){
+        lossi=abs(simlsi/(log(cfunc(sigi,r,lami,X,u))/sigi)-1)
+      }else{
+        lossi=abs(simlsi/cfunc(sigi,r,lami,X,u)-1)
+      }
+      
+      if(is.na(lossi)==FALSE){
+        if(lossi<rells){
+          optsig=sigi
+          optlam=lami
+          rells=lossi
+          optsimls=simlsi
+          optactls=log(cfunc(sigi,r,lami,X,u))/sigi
+        }else{
+          next
+        }
+      }
+    }
+  }
+  return(list(optsig,optlam,rells,optsimls,optactls))
+}
+#迭代搜索空间学习sig,paralam
+siginf=-10
+sigsup=1
+laminf=0
+lamsup=10
+optsol=risklqr(X,u,lens,siginf,sigsup,laminf,lamsup)
+optsig=optsol[[1]]
+optlam=optsol[[2]]
+if(optlam<1){
+  optsol=risklqr(X,u,lens,optsig-1,optsig+1,0,optlam+0.5)
+}else{
+  optsol=risklqr(X,u,lens,optsig-1,optsig+1,optlam-1,optlam+1)
+}
+optsig=optsol[[1]]
+optlam=optsol[[2]]
+simls=optsol[[4]]
+actls=optsol[[5]]
+solution=solver(optsig,r,optlam,x0,lens)
+xopt=solution[[1]]
+uopt=solution[[2]]
+S=solution[[3]]
+pseq=solution[[4]]
+for(i in 1:(lens-1)){
+  print(eigen(S[[i]])$`values`)
+}
+pseq
+
+#sigma,r学习效果检验
+#vy
+uopt=list()
+xopt=data.frame(rep(NA,lens))
+plot(x=1:lens,y=-X[1,],type="l",col=1,ylim=c(4.5,15),lwd=2)
+for(i in 1:5){
+  solution=solver(optsig,r,optlam,x0,lens)
+  xopt[,i]=t(solution[[1]][1,])
+  #uopt[[i]]=solution[[2]]
+  lines(x=1:lens,y=-xopt[,i],col=i)
+}
+lines(x=1:lens,y=-rowMeans(xopt),col="blue",lwd=2)
+abline(h=7,col="red",lwd=2)
+
+#control
+plot(x=1:lens,y=u,type="l",col=1,lwd=2)
+for(i in 1:5){
+  lines(x=1:lens,y=uopt[[i]],col=i)
+}
+
+
+#全样本sigma,paralam学习
+parasig=numeric()
+lam=numeric()
+simls=numeric()
+actls=numeric()
+for(i in 661:700){ #6:20开始往后是精确的 #i in 1:3034
+  #提取动力学方程
+  X=datproc(i)[[1]]
+  u=datproc(i)[[2]]
+  A=datproc(i)[[3]]
+  B=datproc(i)[[4]]
+  C=datproc(i)[[5]]
+  Sigma=datproc(i)[[6]]
+  lens=datproc(i)[[7]]
+  x0=X[,1]
+  #学习sigma,paralam
+  siginf=-10
+  sigsup=10
+  laminf=0
+  lamsup=10
+  optsol=risklqr(X,u,lens,siginf,sigsup,laminf,lamsup)
+  optsig=optsol[[1]]
+  optlam=optsol[[2]]
+  if(optlam<1){
+    optsol=risklqr(X,u,lens,optsig-1,optsig+1,0,optlam+0.5)
+  }else{
+    optsol=risklqr(X,u,lens,optsig-1,optsig+1,optlam-1,optlam+1)
+  }
+  parasig[i]=optsol[[1]]
+  lam[i]=optsol[[2]]
+  simls[i]=optsol[[4]]
+  actls[i]=optsol[[5]]
+  if(abs(simls[i]/actls[i]-1)>0.1){
+    if(lam[i]<1){
+      optsol=risklqr(X,u,lens,parasig[i]-1,parasig[i]+1,0,lam[i]+0.5)
+    }else{
+      optsol=risklqr(X,u,lens,parasig[i]-1,parasig[i]+1,lam[i]-1,lam[i]+1)
+    }
+    parasig[i]=optsol[[1]]
+    lam[i]=optsol[[2]]
+    simls[i]=optsol[[4]]
+    actls[i]=optsol[[5]]
+  }
+  if(abs(simls[i]/actls[i]-1)>0.1){
+    if(lam[i]<1){
+      optsol=risklqr(X,u,lens,parasig[i]-1,parasig[i]+1,0,lam[i]+0.5)
+    }else{
+      optsol=risklqr(X,u,lens,parasig[i]-1,parasig[i]+1,lam[i]-1,lam[i]+1)
+    }
+    parasig[i]=optsol[[1]]
+    lam[i]=optsol[[2]]
+    simls[i]=optsol[[4]]
+    actls[i]=optsol[[5]]
+  }
+}
+```
+
+#读取着陆时间信息(白天晚上)+起降机场
+```{r}
+address=list.files("D:/THU PC/学习/科研/国航QAR/demo/A320",full.names=TRUE)
+baseinfo=data.frame(t(rep(NA,6)))
+colnames(baseinfo)=c("flightNO","org","des","date","hr","min")
+for(i in 2:5128){
+   #QAR
+   addinfo=read.csv(address[i],stringsAsFactors=FALSE,header=FALSE)
+   #提取航班号,起降机场
+   baseinfo[i,1:3]=c(substr(addinfo[2,1],11,16),substr(addinfo[2,2],8,10),substr(addinfo[2,3],13,15))
+   #给a320合并上真实时间列
+   #a320[[i]]=left_join(a320[[i]],data.frame(line_index=as.numeric(addinfo[-1:-4,1]),acttime=as.character(addinfo[-1:-4,3])),by=c("line_index"="line_index"))
+   #提取着陆时刻
+   baseinfo[i,4:6]=as.numeric(c(substr(a320[[i]]$acttime[idlnd[i]],9,10),substr(a320[[i]]$acttime[idlnd[i]],12,13),substr(a320[[i]]$acttime[idlnd[i]],15,16)))
+}
+baseinfo$night=(baseinfo$hr-10)>=0   #是否晚上降落,认为18点以后是晚上(QAR里时间应当-8来看)
+baseinfo$org=as.factor(baseinfo$org)
+baseinfo$des=as.factor(baseinfo$des)
+
+##baseinfo按照老师的接地点判断提取全量
+address=list.files("D:/THU PC/学习/科研/国航QAR/demo/A320",full.names=TRUE)
+baseinfofull=data.frame(t(rep(NA,6)))
+colnames(baseinfofull)=c("flightNO","org","des","date","hr","min")
+for(i in 1:5128){
+   #QAR
+   addinfo=read.csv(address[i],stringsAsFactors=FALSE,header=FALSE)
+   #提取航班号,起降机场
+   baseinfofull[i,1:3]=c(substr(addinfo[2,1],11,16),substr(addinfo[2,2],8,10),substr(addinfo[2,3],13,15))
+   #给a320合并上真实时间列
+   #a320[[i]]=left_join(a320[[i]],data.frame(line_index=as.numeric(addinfo[-1:-4,1]),acttime=as.character(addinfo[-1:-4,3])),by=c("line_index"="line_index"))
+   #提取着陆时刻
+   baseinfofull[i,4:6]=as.numeric(c(substr(a320[[i]]$acttime[idlndnew[i]],9,10),substr(a320[[i]]$acttime[idlndnew[i]],12,13),substr(a320[[i]]$acttime[idlndnew[i]],15,16)))
+}
+baseinfofull$night=(baseinfofull$hr-10)>=0   #是否晚上降落,认为18点以后是晚上(QAR里时间应当-8来看)
+baseinfofull$org=as.factor(baseinfofull$org)
+baseinfofull$des=as.factor(baseinfofull$des)
+
+write.csv(baseinfofull,file="D:/THU PC/学习/科研/国航QAR/final/final vic/320baseinfofull.csv",row.names=FALSE)
+
+#18.3月全国机场的天气
+##各样本水平风切变情况统计
+shear=data.frame(tapply(X=rawdata2$deltawind,INDEX=list(id=as.factor(rawdata2$id),level=rawdata2$deltawind),FUN=length))
+baseinfo$nishear[valid[-idabnorm]]=!is.na(shear[,1])
+baseinfo$shunshear[valid[-idabnorm]]=!is.na(shear[,3])
+baseinfo$shear[valid[-idabnorm]]=!(is.na(shear[,1])&is.na(shear[,3]))
+##一般高原机场标签,一个高高原都没有
+plateau=read.csv("D:/THU PC/学习/科研/国航QAR/final/final vic/一般高原机场列表.csv",header=TRUE,stringsAsFactors=TRUE)
+baseinfo$high=baseinfo$des%in%plateau[,3]
+baseinfo$kmg=baseinfo$des%in%as.factor("KMG")
+
+
+##sig,r密度分布图
+plot(density(parasig),xlab="sigma",main="Density Plot of sigma")
+plot(density(lam),xlab="r",main="Density Plot of r")
+plot(density(lam),xlab="r",main="Density Plot of r",xlim=c(0,1.5))
+##特殊机场+着陆晚上+风切变与sig,r间关系图
+library(ggplot2)
+ggplot(data=baseinfo[valid[-idabnorm][1:560],],aes(y=parasig,x=hr,col=shunshear,pch=high,alpha=0.6,cex=high))+geom_point()
+ggplot(data=baseinfo[valid[-idabnorm][1:560],],aes(y=lam,x=hr,col=shunshear,pch=high,alpha=0.6,cex=high))+geom_point()+ylim(0,0.5)
+summary(baseinfo$high[valid[-idabnorm][1:560]])
+```
+
+#risk-sensitiveLQR,画vy轨迹彩虹图
+```{r}
+solverrbw=function(sigma,r,paralam,x0,lens,start){
+  q=list()
+  q[[lens-1]]=matrix(c(1,0,0,0),nrow=2,ncol=2)
+  w=list()
+  w[[lens]]=paralam*matrix(c(1,0,0,0),nrow=2,ncol=2)  #最终20ft时与标准vy的偏差加权重
+  s=solve(solve(Sigma[[lens-1]])-sigma*w[[lens]]-sigma*q[[lens-1]])
+  S=list()
+  S[[lens-1]]=s
+  wbar=list()
+  wbar[[lens]]=w[[lens]]+sigma*w[[lens]]%*%s%*%w[[lens]]
+  qbar=list()
+  qbar[[lens-1]]=q[[lens-1]]+sigma*q[[lens-1]]%*%s%*%q[[lens-1]]
+  what=list()
+  what[[lens]]=wbar[[lens]]+sigma*q[[lens-1]]%*%S[[lens-1]]%*%w[[lens]]
+  qhat=list()
+  qhat[[lens-1]]=qbar[[lens-1]]+sigma*w[[lens]]%*%S[[lens-1]]%*%q[[lens-1]]
+  
+  a=list()
+  a[[lens]]=-paralam*matrix(c(1,0,0,0),nrow=2,ncol=2)%*%c(-0.633,0)#设定20ft时对应xhat/10=0.17m/s~0.216m/s=取均值1.93m/s=0.633ft/s
+            #最终20ft时与标准vy的偏差加权重
+  uopt=numeric()
+  xk=data.frame(rbind(rep(NA,lens),rep(NA,lens)))
+  xk[,start]=x0  #这里x0是观察到的给定的每步vy
+  pseq=numeric()
+  
+  sig1 = 0.4136/10  #标准差随scale缩小/10
+  sig2 = 0.4227/10
+  #sigwind=sqrt(unlist(Sigma)[seq(from=1,to=lens*4,by=4)]-0.304026)
+  for(i in (lens-1):2){
+    p=as.numeric(1/(r+t(B[,i])%*%(wbar[[i+1]]+qbar[[i]])%*%B[,i]+
+                      2*sigma*t(B[,i])%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%B[,i]))
+    AI=A[[i]]-diag(1,nrow=2)
+    mtemp=qhat[[i]]%*%AI+what[[i+1]]%*%A[[i]]
+    w[[i]]=-p*t(mtemp)%*%B[,i]%*%t(B[,i])%*%(mtemp)+
+      t(AI)%*%qbar[[i]]%*%AI+t(A[[i]])%*%wbar[[i+1]]%*%A[[i]]+
+      sigma*t(AI)%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%A[[i]]+
+      sigma*t(t(AI)%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%A[[i]])
+    w[[i]][2:3]=0  #手动清除矩阵计算误差带来的反对角非0
+    
+    q[[i-1]]=matrix(c(1,0,0,0),nrow=2,ncol=2)
+    s=solve(solve(Sigma[[i-1]])-sigma*w[[i]]-sigma*q[[i-1]])
+    S[[i-1]]=s
+    wbar[[i]]=w[[i]]+sigma*w[[i]]%*%s%*%w[[i]]
+    qbar[[i-1]]=q[[i-1]]+sigma*q[[i-1]]%*%s%*%q[[i-1]]
+    what[[i]]=wbar[[i]]+sigma*q[[i-1]]%*%S[[i-1]]%*%w[[i]]
+    qhat[[i-1]]=qbar[[i-1]]+sigma*w[[i]]%*%S[[i-1]]%*%q[[i-1]]
+    
+    
+    a[[i]]=-p*t(qhat[[i]]%*%AI+what[[i+1]]%*%A[[i]])%*%B[,i]%*%t(B[,i])%*%((qhat[[i]]+what[[i+1]])%*%C[,i]+(diag(1,nrow=2)+sigma*(w[[i+1]]+q[[i]])%*%S[[i]])%*%a[[i+1]])+
+      t(AI)%*%qbar[[i]]%*%C[,i]+t(A[[i]])%*%wbar[[i+1]]%*%C[,i]+t(A[[i]])%*%a[[i+1]]+
+      sigma*t(q[[i]]%*%AI+w[[i+1]]%*%A[[i]])%*%S[[i]]%*%a[[i+1]]+
+      sigma*t(A[[i]])%*%w[[i+1]]%*%S[[i]]%*%q[[i]]%*%C[,i]+
+      sigma*t(AI)%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%C[,i]
+    pseq=c(pseq,p)
+  }
+  
+  for(i in start:(lens-1)){
+    p=as.numeric(1/(r+t(B[,i])%*%(wbar[[i+1]]+qbar[[i]])%*%B[,i]+
+                      2*sigma*t(B[,i])%*%q[[i]]%*%S[[i]]%*%w[[i+1]]%*%B[,i]))
+    AI=A[[i]]-diag(1,nrow=2)
+    
+    uopt[i]=-p*t(B[,i])%*%(qhat[[i]]%*%(AI%*%xk[,i]+C[,i])+what[[i+1]]%*%(A[[i]]%*%xk[,i]+C[,i])+(diag(1,nrow=2)+sigma*(w[[i+1]]+q[[i]])%*%S[[i]])%*%a[[i+1]])
+    
+    xk[,i+1]=A[[i]]%*%xk[,i]+B[,i]*uopt[i]+C[,i]+
+      c(rnorm(n=1,mean=0,sd=sig1),rnorm(n=1,mean=0,sd=sig2))
+    #风的随机效应,系数是随机变量,sd=0.03192,再乘以观测到的外生的风,sd=sigwind[i],sig1,sig2分别是两个拟合的残差sd
+  }
+  uopt[lens]=NA
+  
+  return(list(xk[start:lens],uopt[start:lens],S,pseq))
+}
+
+#id:41飞得好,225先上升然后飞得好
+id=164
+X=datproc(id)[[1]]
+u=datproc(id)[[2]]
+A=datproc(id)[[3]]
+B=datproc(id)[[4]]
+C=datproc(id)[[5]]
+Sigma=datproc(id)[[6]]
+lens=datproc(id)[[7]]
+x0=X[,1]
+##画状态彩虹图
+r=0
+sigma=parasig[id]
+paralam=lam[id]
+xopt=data.frame(rep(NA,lens))
+plot(x=1:lens,y=-X[1,],type="l",col="grey",ylim=c(0.5,1.3),lwd=2,xlab="Time",ylab="State x",main=paste("id:",id,", sigma=",round(sigma,2),", r=",round(paralam,4),sep=""))
+points(x=1:lens,y=-X[1,],col="grey",pch=19)
+text(x=13,y=1.2,labels=paste("observed states"),col="grey",font=1)
+for(k in 1:(lens-1)){
+  x0=X[,k]
+  for(i in 1:10){
+    solution=solverrbw(sigma,r,paralam,x0,lens,k)
+    pseq=solution[[4]]
+    if(length(which(pseq>0))==(lens-2)){
+      xopt=t(solution[[1]][1,])
+      rbwcol=col2rgb(rainbow(lens-1)[k])
+      lines(x=k:lens,y=-xopt,col=rgb(rbwcol[1],rbwcol[2],rbwcol[3],alpha=50,maxColorValue=255),lwd=1)
+    }
+  }
+}
+abline(h=0.633,col="red",lwd=1)
+lines(x=1:lens,y=-X[1,],type="l",col="grey",lwd=2)
+##画控制彩虹图
+plot(x=1:lens,y=u,type="l",col="grey",ylim=c(-0.1,0.15),lwd=2,xlab="Time",ylab="Control u",main=paste("id:",id,", sigma=",round(sigma,2),", r=",round(paralam,4),sep=""))
+points(x=1:lens,y=u,col="grey",pch=19)
+text(x=13,y=1.2,labels=paste("observed control"),col="grey",font=1)
+for(k in 1:(lens-1)){
+  x0=X[,k]
+  for(i in 1:10){
+    solution=solverrbw(sigma,r,paralam,x0,lens,k)
+    pseq=solution[[4]]
+    if(length(which(pseq>0))==(lens-2)){
+      uopt=solution[[2]]
+      rbwcol=col2rgb(rainbow(lens-1)[k])
+      lines(x=k:lens,y=uopt,col=rgb(rbwcol[1],rbwcol[2],rbwcol[3],alpha=50,maxColorValue=255),lwd=1)
+    }
+  }
+}
+lines(x=1:lens,y=u,type="l",col="grey",lwd=2)
+
+##模拟wind path风变大之后的彩虹图
+id=1
+X=datproc(id)[[1]]
+u=datproc(id)[[2]]
+A=datproc(id)[[3]]
+B=datproc(id)[[4]]
+C=datproc(id)[[5]]
+Sigma=datproc(id)[[6]]
+lens=datproc(id)[[7]]
+x0=X[,1]
+#画风和u关系图
+plot(x=1:lens,y=C[1,]*100+11.8,ylim=c(-0.2,0.5),main=paste("id:",id,"wind effect & control",sep=""),type="l")
+points(x=1:lens,y=C[1,]*100+11.8)
+lines(x=1:lens,y=u,col="blue")
+
+##画状态彩虹图
+D=rbind(rnorm(lens,0,0.01),0)  #wind path增加波动性
+r=0
+sigma=parasig[id]
+paralam=lam[id]
+xopt=data.frame(rep(NA,lens))
+plot(x=1:lens,y=-X[1,],type="l",col="grey",ylim=c(0.5,1.3),lwd=2,xlab="Time",ylab="State x",main=paste("id:",id,", sigma=",round(sigma,2),", r=",round(paralam,4),sep=""))
+points(x=1:lens,y=-X[1,],col="grey",pch=19)
+text(x=13,y=1.2,labels=paste("observed states"),col="grey",font=1)
+for(k in 1:1){
+  x0=X[,k]
+  for(i in 1:5){
+    solution=solverrbw(sigma,r,paralam,x0,lens,k)
+    pseq=solution[[4]]
+    if(length(which(pseq>0))==(lens-2)){
+      xopt=t(solution[[1]][1,])
+      rbwcol=col2rgb(rainbow(lens-1)[k])
+      lines(x=k:lens,y=-xopt,col=rgb(rbwcol[1],rbwcol[2],rbwcol[3],alpha=150,maxColorValue=255),lwd=1)
+    }
+  }
+}
+C=c+D
+for(k in 1:1){
+  x0=X[,k]
+  for(i in 1:5){
+    solution=solverrbw(sigma,r,paralam,x0,lens,k)
+    pseq=solution[[4]]
+    if(length(which(pseq>0))==(lens-2)){
+      xopt=t(solution[[1]][1,])
+      rbwcol=col2rgb(rainbow(lens-1)[k])
+      lines(x=k:lens,y=-xopt,col=rgb(0,0,255,alpha=150,maxColorValue=255),lwd=1,lty=2)
+    }
+  }
+}
+abline(h=0.633,col="red",lwd=1)
+lines(x=1:lens,y=-X[1,],type="l",col="grey",lwd=2)
+##画控制彩虹图
+C=datproc(id)[[5]]
+plot(x=1:lens,y=u,type="l",col="grey",ylim=c(-0.1,0.15),lwd=2,xlab="Time",ylab="Control u",main=paste("id:",id,", sigma=",round(sigma,2),", r=",round(paralam,4),sep=""))
+points(x=1:lens,y=u,col="grey",pch=19)
+text(x=13,y=1.2,labels=paste("observed control"),col="grey",font=1)
+for(k in 1:1){
+  x0=X[,k]
+  for(i in 1:5){
+    solution=solverrbw(sigma,r,paralam,x0,lens,k)
+    pseq=solution[[4]]
+    if(length(which(pseq>0))==(lens-2)){
+      uopt=solution[[2]]
+      rbwcol=col2rgb(rainbow(lens-1)[k])
+      lines(x=k:lens,y=uopt,col=rgb(rbwcol[1],rbwcol[2],rbwcol[3],alpha=150,maxColorValue=255),lwd=1)
+    }
+  }
+}
+C=C+D  #wind path增加波动性
+for(k in 1:1){
+  x0=X[,k]
+  for(i in 1:5){
+    solution=solverrbw(sigma,r,paralam,x0,lens,k)
+    pseq=solution[[4]]
+    if(length(which(pseq>0))==(lens-2)){
+      uopt=solution[[2]]
+      rbwcol=col2rgb(rainbow(lens-1)[k])
+      lines(x=k:lens,y=uopt,col=rgb(0,0,255,alpha=150,maxColorValue=255),lwd=1,lty=2)
+    }
+  }
+}
+lines(x=1:lens,y=u,type="l",col="grey",lwd=2)
+#画wind path图
+C=datproc(id)[[5]]
+plot(x=1:lens,y=C[1,],ylim=c(-0.25,0),type="l",main="Wind path",col="red")
+lines(x=1:lens,y=(C+D)[1,],lty=2,col="blue")
+```
+
+
+
+
+
+
+#risk-sensitiveLQR,u比x小10^2量级的情况(仅用于画sigma效果示意图!其他都不用)
+```{r}
+datproc=function(i){ #i in 1:3034
+  k=valid[c(1:3299)[-idabnorm]][i]
+  dat=cbind(a320[[k]][(id200new[k]+2):id20new[k],colind1],a320[[k]][(id200new[k]+1):(id20new[k]-1),colind1[c(-3,-9,-11)]],a320[[k]][id200new[k]:(id20new[k]-2),colind1[c(1,4,5,7,10)]],rep(i,id20new[k]-id200new[k]-1))
+  colnames(dat)=c(colnam,paste(colnam[c(-3,-9,-11)],rep(1,8),sep=""),paste(colnam[c(1,4,5,7,10)],rep(2,5),sep=""))
+  
+  dat$vy=dat$vy/60  #vy单位改为ft/s
+  dat$vy1=dat$vy1/60
+  dat$deltavy=dat$vy-dat$vy1
+  #pitch单位扩大10^2
+  dat$pitch=dat$pitch*100
+  dat$pitch1=dat$pitch1*100
+  dat$pitch2=dat$pitch2*100
+  #俯仰角单位由度变成rad
+  dat$pitch=dat$pitch*pi/180
+  dat$pitch1=dat$pitch1*pi/180
+  dat$pitch2=dat$pitch2*pi/180
+  #算两秒deltapitch平均作为控制量
+  #俯仰角变化量
+  dat$deltapitch=dat$pitch-dat$pitch1
+  dat$deltapitch1=dat$pitch1-dat$pitch2
+  dat$deltapitch2=(dat$pitch-dat$pitch2)/2
+  #vx单位由nm/h改为ft/s
+  dat$vx1=dat$vx1*6076.1154856/60/60
+  dat$vx=dat$vx*6076.1154856/60/60
+  #用vx近似计算lift影响,用这个
+  dat$forcexy=(dat$vx1*6076.1154856/60/60)/dat$weight1*dat$vy1*100  #乘100是因为pitch rescale
+  dat$forcep=(dat$vx1*6076.1154856/60/60)^2/dat$weight1*dat$deltapitch2
+  #提取顺/逆风大小
+  dat$vshun=dat$vpara
+  dat$vshun[(dat$vpara)<0]=0
+  dat$vni=dat$vpara
+  dat$vni[(dat$vpara)>0]=0
+  #提取风和前2秒方向变化
+  dat$deltawind=dat$vpara-dat$vpara2
+  dat$deltawind[which(dat$deltawind<=5 & dat$deltawind>=(-5))]=0
+  dat$deltawind[which(dat$deltawind>5)]=1
+  dat$deltawind[which(dat$deltawind<(-5))]=-1
+  dat$deltawind=as.factor(dat$deltawind)
+  #1为变得更顺风,-1为变得更逆风,0变化不大
+  
+  #X序列(变量scale缩小/10,协方差矩阵/100,系数不变)
+  X=rbind(dat$vy1,dat$pitch/10^2)/10
+  u=dat$deltapitch2/10/10^2
+  b=summary(fitw.rem2)$`coefficients`[8,1]+summary(fitw.rem2)$`coefficients`[10,1]*dat$vx1^2/dat$weight1
+  B=rbind(b*10^2,rep(1,nrow(dat)))
+  C=rbind(summary(fitw.rem2)$`coefficients`[1,1]*dat$vshun+summary(fitw.rem2)$`coefficients`[2,1]*dat$vni+summary(fitw.rem2)$`coefficients`[2+as.numeric(dat$deltawind),1],0)/10
+  var1=summary(fitw.rem2)$`sigma`^2
+  var2=summary(fitu)$`sigma`^2/10^4
+  A=list()
+  Sigma=list()
+  for(i in 1:nrow(dat)){
+    a1=summary(fitw.rem2)$`coefficients`[6,1]+summary(fitw.rem2)$`coefficients`[9,1]*dat$vx1[i]/dat$weight1[i]*100  #这里是跟着上面datscale带来的,不动
+    a2=summary(fitw.rem2)$`coefficients`[7,1]
+    A[[i]]=matrix(c(a1,0,a2*10^2,0),nrow=2)+diag(1,nrow=2)  #y从deltavy变为vy_t+1
+    
+    Sigma[[i]]=diag(x=c(var1,var2),nrow=2)/100
+  }
+  lens=nrow(dat)
+  
+  return(list(X,u,A,B,C,Sigma,lens))
+}
+
+```
+
+
+
+
+#II.Probabilistic Relations
+```{r}
+#graphical lasso学习
+library(glasso)
+library(gRbase)
+library(Rgraphviz)
+library(gRim)
+gdata=cbind(attrnew[,-30],tau,v0,lambda,c(alnd[-idabnorm],alndh),vylnd,c(paravib1$beta,paravibh$beta),c(paravib1$maxdif,paravibh$maxdif))
+colnames(gdata)[38:44]=c("tau","v0","lambda","alnd","vylnd","postlnd.beta","postlnd.maxdif")
+gdata$initvy=NA
+gdata$initpitch=NA
+#加入200ft初始状态
+for(i in 1:3034){
+  k=valid[c(1:3299)[-idabnorm][i]]
+  gdata[i,45:46]=t(c(a320[[k]][id200[k],"Inertial.Vertical.spd.CA"],a320[[k]][id200[k],"pitch.agl"]))
+}
+#加入中间过程的QARincidents
+#接地平飘时间长(50ft到接地),着陆俯仰角大/小,进近速度
+gdata$tflare=NA
+for(i in 1:3034){
+  k=valid[c(1:3299)[-idabnorm][i]]
+  gdata[i,47]=19-id50[k]
+}
+#加入风切变次数
+gdata$cntshearshun=c(as.numeric(tapply(as.numeric((rawdata2$vpara-rawdata2$vpara2)>5),INDEX=rawdata2$id,FUN=sum)),rep(NA,6))  #顺风风切变
+gdata$cntshearni=c(as.numeric(tapply(as.numeric((rawdata2$vpara-rawdata2$vpara2)<(-5)),INDEX=rawdata2$id,FUN=sum)),rep(NA,6))  #逆风风切变
+gdata$cntshear=gdata$cntshearshun+gdata$cntshearni
+#加入风的波动性
+gdata$sdvpara=c(as.numeric(tapply(rawdata2$vpara-rawdata2$vpara2,INDEX=rawdata2$id,FUN=sd)),rep(NA,6))
+#加入50ft线性插值出来的vy和vratio
+gdata$vy50=NA
+gdata$vratio50=NA
+for(i in 1:3034){
+  k=valid[c(1:3299)[-idabnorm][i]]
+  dat1=a320[[k]][(idlnd[k]-18+id50[k]-1),]
+  dat2=a320[[k]][(idlnd[k]-18+id50[k]),]
+  rat=(dat1$height-50)/(dat1$height-dat2$height)
+  vy50=dat1$Inertial.Vertical.spd.CA+rat*(dat1$Inertial.Vertical.spd.CA-dat2$Inertial.Vertical.spd.CA)
+  vx50=dat1$GPS.GROUND.SPEED.CAPT+rat*(dat1$GPS.GROUND.SPEED.CAPT-dat2$GPS.GROUND.SPEED.CAPT)
+  gdata[i,52:53]=c(vy50,vy50/vx50)
+}
+#gdata里的vylnd改成用最后两秒均值
+for(i in 1:3034){
+  k=valid[c(1:3299)[-idabnorm][i]]
+  dat=a320[[k]][(idlnd[k]-1):idlnd[k],]
+  gdata[i,"vylnd"]=mean(dat$Inertial.Vertical.spd.CA)
+}
+
+
+#mixggm学习
+library(mixggm)
+# plot(mggm, what = "graph")
+# plot(mggm, what = "classification")
+# plot(mggm, what = "adjacency")
+
+##有用的是这个
+mggm=mixGGM(cbind(gdata[1:700,c(45,2:4,52:53,11:13,32:33,36:37,47,41:42)],parasig,lam),model="concentration",K=3,penalty="bic",search="step-back")
+plot(mggm, what = "graph")
+
+#再精细分一下第1类(分的效果不好,先不分)
+# sub1mggm=mixGGM(cbind(gdata[which(mggm$classification==1),c(45,2:4,52:53,11:13,32:33,36:37,47,41:42)],parasig[which(mggm$classification==1)],lam[which(mggm$classification==1)]),model="concentration",K=2,penalty="ebic",beta=0.6,search="step-for")
+# plot(sub1mggm, what = "graph")
+#再精细分一下第3类
+sub3mggm=mixGGM(cbind(gdata[which(mggm$classification==3),c(45,2:4,52:53,11:13,32:33,36:37,47,41:42)],parasig.=parasig[which(mggm$classification==3)],lam.=lam[which(mggm$classification==3)]),model="concentration",K=2,penalty="ebic",beta=0.11,search="step-back")
+plot(sub3mggm, what = "graph")
+
+# sub3mggm1=mixGGM(cbind(gdata[which(mggm$classification==3),c(45,2:4,52:53,11:13,32:33,36:37,47,41:42)],parasig[which(mggm$classification==3)],lam[which(mggm$classification==3)]),model="concentration",K=3,penalty="bic",search="step-for")
+# plot(sub3mggm1, what = "graph")
+
+#各类风的情况
+tapply(gdata$sdvpara[1:700],INDEX=mggm$classification,FUN=mean)
+tapply(gdata$cntshear[1:700],INDEX=mggm$classification,FUN=mean)
+#各类特征sd
+apply(mggm$data,MARGIN=2,FUN=tapply,INDEX=mggm$classification,sd)
+apply(sub3mggm$data,MARGIN=2,FUN=tapply,INDEX=sub3mggm$classification,sd)
+
+
+
+##MixGaussian应用演示
+#1.已知initvy+parasig+lam,求alnd,vylnd,tflare范围
+#plot(density(mggm$data[,"vylnd"]),main="Marginal Density of Landing Vertical Speed") #聚类估计
+#计算已知lam,parasig,invivy后各类后验概率
+library(mvtnorm)
+prep=c(mggm$parameters$tau[1],mggm$parameters$tau[2],mggm$parameters$tau[3]*sub3mggm$parameters$tau)
+postp=function(initvy,parasig,lam){
+  denom=prep*c(dmvnorm(x=c(initvy,parasig,lam),mean=mggm$parameters$mu[c("initvy","parasig","lam"),1],sigma=mggm$parameters$sigma[,,1][c("initvy","parasig","lam"),c("initvy","parasig","lam")]),dmvnorm(x=c(initvy,parasig,lam),mean=mggm$parameters$mu[c("initvy","parasig","lam"),2],sigma=mggm$parameters$sigma[,,2][c("initvy","parasig","lam"),c("initvy","parasig","lam")]),dmvnorm(x=c(initvy,parasig,lam),mean=sub3mggm$parameters$mu[c("initvy","parasig.","lam."),1],sigma=sub3mggm$parameters$sigma[,,1][c("initvy","parasig.","lam."),c("initvy","parasig.","lam.")]),dmvnorm(x=c(initvy,parasig,lam),mean=sub3mggm$parameters$mu[c("initvy","parasig.","lam."),2],sigma=sub3mggm$parameters$sigma[,,2][c("initvy","parasig.","lam."),c("initvy","parasig.","lam.")]))
+  return(denom/sum(denom))
+}
+
+
+#计算vylnd条件密度分布
+conddens=function(var,x,y,z,clust){
+  if(clust==1||clust==2){
+    cndens=dmvnorm(c(var,x,y,z),mean=mggm$parameters$mu[c("vylnd","initvy","parasig","lam"),clust],sigma=mggm$parameters$sigma[,,clust][c("vylnd","initvy","parasig","lam"),c("vylnd","initvy","parasig","lam")])/dmvnorm(c(x,y,z),mean=mggm$parameters$mu[c("initvy","parasig","lam"),clust],sigma=mggm$parameters$sigma[,,clust][c("initvy","parasig","lam"),c("initvy","parasig","lam")])
+  }else{
+    cndens=dmvnorm(c(var,x,y,z),mean=sub3mggm$parameters$mu[c("vylnd","initvy","parasig.","lam."),clust-2],sigma=sub3mggm$parameters$sigma[,,clust-2][c("vylnd","initvy","parasig.","lam."),c("vylnd","initvy","parasig.","lam.")])/dmvnorm(c(x,y,z),mean=sub3mggm$parameters$mu[c("initvy","parasig.","lam."),clust-2],sigma=sub3mggm$parameters$sigma[,,clust-2][c("initvy","parasig.","lam."),c("initvy","parasig.","lam.")])
+  }
+  return(cndens)
+}
+
+mpostdens=numeric() #混合条件密度分布(后验)
+id=41 #以id=41的航班为例
+for(seqvylnd in seq(-400,0,length.out=100)){
+  mpostdens=c(mpostdens,sum(postp(gdata[id,"initvy"],parasig[id],lam[id])*c(conddens(seqvylnd,gdata[id,"initvy"],parasig[id],lam[id],clust=1),conddens(seqvylnd,gdata[id,"initvy"],parasig[id],lam[id],clust=2),conddens(seqvylnd,gdata[id,"initvy"],parasig[id],lam[id],clust=3),conddens(seqvylnd,gdata[id,"initvy"],parasig[id],lam[id],clust=4))))
+}
+#条件密度分布图
+plot(x=seq(-400,0,length.out=100),y=mpostdens,main=paste("Conditional Density of Landing Vertical Speed.","id:",id,"sigma=",round(parasig[id],2),"lam=",round(lam[id],2),sep=" "),type="l",col=colseq[3],lwd=2,ylim=c(0,0.01))
+lines(density(mggm$data[,"vylnd"]),lwd=1.5) #样本观测原始边际分布
+text(x=-300,y=0.006,"Conditional Density",col=colseq[3])
+text(x=-60,y=0.006,"Marginal Density")
+
+
+#2.已知initvy+parasig+lam+vy50+vratio50+vvert1+vshear1,求alnd,vylnd,tflare范围
+#plot(density(mggm$data[,"vylnd"]),main="Marginal Density of Landing Vertical Speed") #聚类估计
+#计算已知lam,parasig,invivy+vy50,vratio50,vvert1,vshear1后各类后验概率
+#library(mvtnorm)
+#prep=c(mggm$parameters$tau[1],mggm$parameters$tau[2],mggm$parameters$tau[3]*sub3mggm$parameters$tau)
+slic=c("initvy","parasig","lam","vy50","vratio50","vvert1","vshear1")
+subslic=c("initvy","parasig.","lam.","vy50","vratio50","vvert1","vshear1")
+postp2=function(initvy,parasig,lam,vy50,vratio50,vvert1,vshear1){
+  denom=prep*c(dmvnorm(x=c(initvy,parasig,lam,vy50,vratio50,vvert1,vshear1),mean=mggm$parameters$mu[slic,1],sigma=mggm$parameters$sigma[,,1][slic,slic]),dmvnorm(x=c(initvy,parasig,lam,vy50,vratio50,vvert1,vshear1),mean=mggm$parameters$mu[slic,2],sigma=mggm$parameters$sigma[,,2][slic,slic]),dmvnorm(x=c(initvy,parasig,lam,vy50,vratio50,vvert1,vshear1),mean=sub3mggm$parameters$mu[subslic,1],sigma=sub3mggm$parameters$sigma[,,1][subslic,subslic]),dmvnorm(x=c(initvy,parasig,lam,vy50,vratio50,vvert1,vshear1),mean=sub3mggm$parameters$mu[subslic,2],sigma=sub3mggm$parameters$sigma[,,2][subslic,subslic]))
+  return(denom/sum(denom))
+}
+
+
+#计算vylnd条件密度分布
+conddens2=function(var,x,y,z,u,v,w,s,clust){
+  if(clust==1||clust==2){
+    cndens=dmvnorm(c(var,x,y,z,u,v,w,s),mean=mggm$parameters$mu[c("vylnd",slic),clust],sigma=mggm$parameters$sigma[,,clust][c("vylnd",slic),c("vylnd",slic)])/dmvnorm(c(x,y,z,u,v,w,s),mean=mggm$parameters$mu[slic,clust],sigma=mggm$parameters$sigma[,,clust][slic,slic])
+  }else{
+    cndens=dmvnorm(c(var,x,y,z,u,v,w,s),mean=sub3mggm$parameters$mu[c("vylnd",subslic),clust-2],sigma=sub3mggm$parameters$sigma[,,clust-2][c("vylnd",subslic),c("vylnd",subslic)])/dmvnorm(c(x,y,z,u,v,w,s),mean=sub3mggm$parameters$mu[subslic,clust-2],sigma=sub3mggm$parameters$sigma[,,clust-2][subslic,subslic])
+  }
+  return(cndens)
+}
+
+mpostdens2=numeric() #混合条件密度分布(后验)
+id=41 #以id=41的航班为例
+for(seqvylnd in seq(-400,0,length.out=100)){
+  mpostdens2=c(mpostdens2,sum(postp2(gdata[id,"initvy"],parasig[id],lam[id],gdata[id,"vy50"],gdata[id,"vratio50"],gdata[id,"vvert1"],gdata[id,"vshear1"])*c(conddens2(seqvylnd,gdata[id,"initvy"],parasig[id],lam[id],gdata[id,"vy50"],gdata[id,"vratio50"],gdata[id,"vvert1"],gdata[id,"vshear1"],clust=1),conddens2(seqvylnd,gdata[id,"initvy"],parasig[id],lam[id],gdata[id,"vy50"],gdata[id,"vratio50"],gdata[id,"vvert1"],gdata[id,"vshear1"],clust=2),conddens2(seqvylnd,gdata[id,"initvy"],parasig[id],lam[id],gdata[id,"vy50"],gdata[id,"vratio50"],gdata[id,"vvert1"],gdata[id,"vshear1"],clust=3),conddens2(seqvylnd,gdata[id,"initvy"],parasig[id],lam[id],gdata[id,"vy50"],gdata[id,"vratio50"],gdata[id,"vvert1"],gdata[id,"vshear1"],clust=4))))
+}
+#条件密度分布图
+plot(x=seq(-400,0,length.out=100),y=mpostdens2,main=paste("Conditional Density of Landing Vertical Speed.","id:",id,"sigma=",round(parasig[id],2),"lam=",round(lam[id],2),sep=" "),type="l",col="blue",lwd=2,ylim=c(0,0.01))
+lines(x=seq(-400,0,length.out=100),y=mpostdens,lwd=2,col=colseq[3])
+lines(density(mggm$data[,"vylnd"]),lwd=1.5) #样本观测原始边际分布
+text(x=-300,y=0.006,"Conditional Density\n|initvy,sigma,r",col=colseq[3])
+text(x=-300,y=0.008,"Conditional Density\n|initvy,sigma,r,vy50,vratio50,vvert1,vshear1",col="blue")
+text(x=-60,y=0.006,"Marginal Density")
+```
+
